@@ -4540,6 +4540,20 @@ Hand back the report and STOP. Do not start a follow-up without me.
     fresh backbone checkpoint. If reusing `outputs/full_all_pipeline_stage2_test_20260627`, delete
     completed non-`*_backbone` stage2 run dirs first; otherwise `--resume` will skip the old
     one-epoch stage2 summaries.
+    Local serial ETTh1-H720 check after the fix:
+    `outputs\local_etth1_h720_pipeline_check_20260627` with `cuda:0`, one worker, one job. Config
+    inspection confirmed backbone `epochs=29/lr=0.001`, no output anchors; stage2
+    `epochs=25/lr=0.001`, test enabled, and fresh-backbone checkpoint load. Results: raw backbone
+    `val=1.5719995/0.8455416`, matching the server no-anchor level. Stage2 ran all 25 epochs
+    (`best_epoch=[16,16,16]`), so the 1-epoch bug is fixed. However `moe_residual_selection`
+    stayed `null`, penalty lambdas remained `0.0`, and final selection was
+    `learnable_output_anchor_refiner` with `moe_residual=none`. Same-run static output anchor
+    improved raw val to `1.4004068/0.8013401`; learnable refiner improved val to
+    `1.2906321/0.7715432` but regressed test from static `0.4627491/0.4609515` to refined
+    `0.4732509/0.4670769`. Current diagnosis: train-budget fix worked; remaining issue is not
+    epoch count but stage2 candidate/eval wiring or config inheritance for PKR-MoE residual
+    participation on this ETTh1-H720 path (`pred_side_residual.enable:false`,
+    `lambda_init=0`, `learnable_lambda=false`).
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
