@@ -4330,3 +4330,28 @@ Hand back the report and STOP. Do not start a follow-up without me.
     same learnable-anchor block into root `configs/PEMS08_H96.yaml`. Do not tune further on this
     PEMS08 test read; next PEMS action should be a separate formal val-only run for another horizon
     or dataset, not a PEMS08 hyperparameter adjustment.
+  - DUET PEMS table completion (2026-06-27): filled the missing DUET columns for PEMS04/07/08 in
+    `outputs/codex_table_target_20260614/input96_olinear_filtered_comparison.md` from
+    `D:/desktop/新建 文本文档.csv`, whose reports point to the server run root
+    `/data2/hechengxin/gqb/project/DUET/result/server_duet_pems_input96_split712`. Values were
+    rounded to the table's 3-decimal format: PEMS04 Avg `0.115/0.227`, PEMS07 Avg `0.105/0.213`,
+    and PEMS08 Avg `0.110/0.218` (with per-horizon 12/24/48/96 rows also populated). Recomputed
+    red/blue ranking spans and count rows after insertion; DUET now has `Top2 Count` MSE `3` and
+    MAE `0`, all from PEMS08 H24/H96/Avg MSE, while OLinear MSE Top2 count drops from `25` to
+    `22`. Table integrity validation confirmed `32` columns and `50` metric rows.
+  - Full learnable-anchor matrix runner (2026-06-27): added
+    `scripts/run_full_learnable_anchor_matrix.py` to generate and run the requested full matrix:
+    ETTh1/ETTh2/ETTm1/ETTm2/weather/electricity at horizons `96/192/336/720` and
+    PEMS03/04/07/08 at horizons `12/24/48/96` (40 jobs total). Default server parallelism matches
+    the available GPUs reported by the user: `cuda:0,cuda:2,cuda:5` with `2` workers per GPU. The
+    runner keeps each base config's training schedule intact, forces `moe.enable: true`, enables
+    the channel-gated `moe.learnable_output_anchor_refiner`, and disables
+    `moe.pred_side_residual` by default because the current trainer otherwise skips the learnable
+    refiner when pred-side residual is active. Dry-run validation command:
+    `python scripts\run_full_learnable_anchor_matrix.py --dry-run --out-root outputs\full_learnable_anchor_matrix_dryrun`
+    generated 40 configs and `summary.csv`; structured YAML check confirmed all 40 configs have
+    the requested horizon, `moe.enable: true`, learnable refiner enabled, and pred-side residual
+    disabled. Full launch command for the server/workstation:
+    `python scripts\run_full_learnable_anchor_matrix.py --out-root outputs\full_learnable_anchor_matrix_20260627 --devices cuda:0,cuda:2,cuda:5 --workers-per-device 2 --resume`.
+    Add `--skip-test` for val-only discipline; omit it only for an intentional full train+test
+    pass.
