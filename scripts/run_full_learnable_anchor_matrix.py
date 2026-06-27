@@ -251,6 +251,9 @@ def apply_backbone_epoch_policy(
     cfg.setdefault("train", {})
     current_epochs = int(cfg["train"].get("epochs", 0) or 0)
     cfg["train"]["epochs"] = max(current_epochs, int(planned_epochs))
+    cfg.setdefault("early_stop", {})
+    current_patience = int(cfg["early_stop"].get("patience", 0) or 0)
+    cfg["early_stop"]["patience"] = max(current_patience, int(planned_epochs))
 
 
 def configure_common_paths(cfg: dict[str, Any], *, job: Job) -> None:

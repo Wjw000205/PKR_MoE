@@ -4455,6 +4455,23 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `python scripts\run_full_learnable_anchor_matrix.py --stage backbone --out-root outputs\backbone_repro_main_table_20260627 --devices cuda:0,cuda:2,cuda:5 --workers-per-device 2 --datasets ETTh1,ETTh2,ETTm1,ETTm2 --horizons 96,192,336,720 --resume`.
     Only after backbone rows match the historical base metrics should `--stage full` be used to
     attach frozen-backbone PKR-MoE and learnable anchors.
+    Server log diagnosis for `outputs/full_all_backbone_then_stage2_20260627`: generated
+    backbone `epochs` were correct, but several jobs still did not reproduce because
+    `early_stop.patience` came from the stage2/root config and truncated the backbone before the
+    main-table epoch floor. Examples from server logs: weather-H192 had `epochs=55` but
+    `patience=1`, so it stopped at epoch 5 with `best_epoch=[4,4,4,4]`; weather-H336 had
+    `epochs=16`/`patience=1` and also stopped at epoch 5; ETTm2-H720 had `epochs=40`/`patience=5`
+    and stopped at epoch 13; ETTh1-H720 had `epochs=29`/`patience=10` and stopped at epoch 26
+    before the historical `[29,19,16]` checkpoint could be selected. Fix: under
+    `--backbone-epoch-policy main-table`, the runner now also raises `early_stop.patience` to at
+    least the planned backbone epoch floor. Regression test:
+    `test_configure_backbone_run_extends_early_stop_patience_to_reach_main_table_epoch_floor`
+    failed before the fix (`weather-H192 patience` stayed `1`) and passes after the fix. Dry-run
+    `outputs\backbone_patience_dryrun_20260627` confirmed `ETTh1-H720 epochs/patience=29/29`,
+    `ETTm2-H96=31/31`, `ETTm2-H720=40/40`, `weather-H192=55/55`, and `weather-H336=16/16`.
+    Do not reuse `outputs/full_all_backbone_then_stage2_20260627` with `--resume` for these rows,
+    because the bad completed backbone summaries would be skipped. Use a new out-root or delete
+    the affected backbone and downstream stage2 run directories before resuming.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
