@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 import scripts.run_full_learnable_anchor_matrix as runner
 from scripts.run_full_learnable_anchor_matrix import (
     DEFAULT_DEVICES,
@@ -9,10 +11,14 @@ from scripts.run_full_learnable_anchor_matrix import (
     Job,
     assign_jobs_to_devices,
     build_matrix,
+    backbone_config_path,
+    backbone_out_dir,
+    configure_backbone_run,
     configure_run,
     format_duration,
     format_progress_line,
     learnable_anchor_config,
+    prepare_configs,
     run_environment_for_job,
     run_assigned,
 )
@@ -40,9 +46,15 @@ def test_configure_run_enables_pkr_moe_and_learnable_anchor_without_changing_tra
         "portrait": {"out_dir": "outputs/base/portraits"},
         "memory": {"path": "old/memory.pt", "checkpoint_path": "old/best.pt"},
         "eval": {"skip_test": False},
-        "train": {"epochs": 36, "lr": 0.001},
+        "train": {"epochs": 36, "lr": 0.001, "freeze_backbone": False},
+        "finetune": {
+            "enable": True,
+            "checkpoint_path": "outputs/missing_backbone/best_checkpoint.pt",
+            "load_model": True,
+        },
         "moe": {
             "enable": False,
+            "freeze_backbone": True,
             "pred_side_residual": {"enable": True},
         },
     }
@@ -70,10 +82,115 @@ def test_configure_run_enables_pkr_moe_and_learnable_anchor_without_changing_tra
     assert cfg["memory"]["checkpoint_path"] == "outputs/full/ETTh2/H192/best_checkpoint.pt"
     assert cfg["portrait"]["out_dir"] == "outputs/full/ETTh2/H192/cluster_portraits"
     assert cfg["eval"]["skip_test"] is False
-    assert cfg["train"] == {"epochs": 36, "lr": 0.001}
+    assert cfg["train"]["epochs"] == 36
+    assert cfg["train"]["lr"] == 0.001
+    assert cfg["train"]["freeze_backbone"] is True
+    assert cfg["finetune"]["enable"] is True
+    assert cfg["finetune"]["checkpoint_path"] == "outputs/full/ETTh2/H192_backbone/best_checkpoint.pt"
+    assert cfg["finetune"]["load_model"] is True
+    assert cfg["finetune"]["strict_window"] is True
+    assert cfg["finetune"]["strict_model"] is True
+    assert cfg["finetune"]["cluster_map"] == "index"
     assert cfg["moe"]["enable"] is True
+    assert cfg["moe"]["freeze_backbone"] is True
     assert cfg["moe"]["pred_side_residual"]["enable"] is False
     assert cfg["moe"]["learnable_output_anchor_refiner"] == learnable_anchor_config()
+
+
+def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
+        "window": {"input_len": 96, "pred_len": 96},
+        "finetune": {
+            "enable": True,
+            "checkpoint_path": "outputs/missing/best_checkpoint.pt",
+            "load_model": True,
+        },
+        "train": {"epochs": 12, "freeze_backbone": True},
+        "moe": {
+            "enable": True,
+            "freeze_backbone": True,
+            "learnable_output_anchor_refiner": {"enable": True},
+        },
+        "memory": {"save_checkpoint": False, "checkpoint_path": "old/best.pt"},
+    }
+    job = Job(
+        dataset="PEMS08",
+        horizon=96,
+        base_config_path=Path("configs/PEMS08_H96.yaml"),
+        config_path=Path("generated/PEMS08_H96.yaml"),
+        out_dir=Path("outputs/full/PEMS08/H96"),
+        device="cuda:5",
+    )
+
+    cfg = configure_backbone_run(
+        base_cfg,
+        job=job,
+    )
+
+    assert cfg["exp"]["name"] == "PEMS08_H96_backbone_full"
+    assert cfg["exp"]["out_dir"] == "outputs/full/PEMS08/H96_backbone"
+    assert cfg["exp"]["device"] == "cuda:5"
+    assert cfg["window"]["pred_len"] == 96
+    assert cfg["eval"]["skip_test"] is True
+    assert cfg["finetune"] == {"enable": False}
+    assert cfg["train"]["epochs"] == 12
+    assert cfg["train"]["freeze_backbone"] is False
+    assert cfg["moe"]["enable"] is False
+    assert cfg["moe"]["freeze_backbone"] is False
+    assert cfg["moe"]["learnable_output_anchor_refiner"]["enable"] is False
+    assert cfg["memory"]["save_checkpoint"] is True
+    assert cfg["memory"]["checkpoint_path"] == "outputs/full/PEMS08/H96_backbone/best_checkpoint.pt"
+
+
+def test_two_stage_paths_are_derived_from_stage2_job() -> None:
+    job = Job(
+        dataset="weather",
+        horizon=720,
+        base_config_path=Path("configs/weather_H720.yaml"),
+        config_path=Path("outputs/full/configs/weather/H720_stage2.yaml"),
+        out_dir=Path("outputs/full/runs/weather/H720"),
+        device="cuda:2",
+    )
+
+    assert backbone_config_path(job) == Path("outputs/full/configs/weather/H720_backbone.yaml")
+    assert backbone_out_dir(job) == Path("outputs/full/runs/weather/H720_backbone")
+
+
+def test_prepare_configs_writes_backbone_and_stage2_configs(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        yaml.safe_dump(
+            {
+                "exp": {"device": "cuda:7", "out_dir": "old"},
+                "window": {"input_len": 96, "pred_len": 96},
+                "train": {"epochs": 2, "freeze_backbone": True},
+                "finetune": {"enable": True, "checkpoint_path": "old/best.pt"},
+                "moe": {"enable": True, "freeze_backbone": True},
+                "memory": {"save_checkpoint": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = Job(
+        dataset="ETTh1",
+        horizon=96,
+        base_config_path=base_path,
+        config_path=tmp_path / "configs" / "ETTh1" / "H96_stage2.yaml",
+        out_dir=tmp_path / "runs" / "ETTh1" / "H96",
+        device="cuda:0",
+    )
+
+    prepare_configs([job], skip_test=True, disable_pred_side_residual=True)
+
+    backbone_cfg = yaml.safe_load(backbone_config_path(job).read_text(encoding="utf-8"))
+    stage2_cfg = yaml.safe_load(job.config_path.read_text(encoding="utf-8"))
+    assert backbone_cfg["moe"]["enable"] is False
+    assert backbone_cfg["memory"]["save_checkpoint"] is True
+    assert backbone_cfg["memory"]["checkpoint_path"].endswith("H96_backbone/best_checkpoint.pt")
+    assert stage2_cfg["moe"]["enable"] is True
+    assert stage2_cfg["moe"]["freeze_backbone"] is True
+    assert stage2_cfg["finetune"]["checkpoint_path"].endswith("H96_backbone/best_checkpoint.pt")
 
 
 def test_assign_jobs_to_devices_round_robins_over_workers() -> None:

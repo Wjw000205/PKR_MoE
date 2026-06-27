@@ -4359,6 +4359,17 @@ Hand back the report and STOP. Do not start a follow-up without me.
     progress while 40 jobs executed. The runner now emits `START` and terminal status lines such as
     `[3/40 7.5%] FAILED ETTh1_H96 device=cuda:0 worker=cuda:0#1 elapsed=00:01:05 ...` while still
     writing `summary.csv` incrementally.
+    Follow-up after server failure: the first server attempt failed because generated configs
+    inherited local `finetune.checkpoint_path` values such as
+    `outputs/fresh_input_len96_20260609_etth2_backbone_ckpt/.../best_checkpoint.pt`, which do not
+    exist in a fresh server checkout. Per user clarification, checkpoints should be retrained in the
+    correct two-stage order: train a fresh backbone checkpoint first, then freeze that backbone and
+    train anchors + PKR-MoE + the learnable output anchor. The runner now generates 40 backbone
+    configs (`*_backbone.yaml`, `moe.enable:false`, `finetune.enable:false`,
+    `memory.save_checkpoint:true`) and 40 stage-2 configs (`*_stage2.yaml`, `finetune.checkpoint_path`
+    pointing to the matching `H*_backbone/best_checkpoint.pt`, `moe.freeze_backbone:true`). Dry-run
+    validation confirmed 40/40 backbone configs save checkpoints and 40/40 stage-2 configs load the
+    matching freshly trained backbone checkpoint.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits

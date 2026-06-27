@@ -116,7 +116,7 @@ def build_matrix(*, out_root: Path, devices: tuple[str, ...] = DEFAULT_DEVICES) 
     if not devices:
         raise ValueError("At least one device is required.")
     for idx, (dataset, horizon) in enumerate(iter_dataset_horizons()):
-        config_path = out_root / "configs" / dataset / f"H{horizon}.yaml"
+        config_path = out_root / "configs" / dataset / f"H{horizon}_stage2.yaml"
         out_dir = out_root / "runs" / dataset / f"H{horizon}"
         jobs.append(
             Job(
@@ -131,17 +131,20 @@ def build_matrix(*, out_root: Path, devices: tuple[str, ...] = DEFAULT_DEVICES) 
     return jobs
 
 
-def configure_run(
-    base_cfg: dict[str, Any],
-    *,
-    job: Job,
-    skip_test: bool,
-    disable_pred_side_residual: bool,
-) -> dict[str, Any]:
-    cfg = copy.deepcopy(base_cfg)
+def backbone_config_path(job: Job) -> Path:
+    return job.config_path.with_name(f"H{job.horizon}_backbone.yaml")
+
+
+def backbone_out_dir(job: Job) -> Path:
+    return job.out_dir.with_name(f"H{job.horizon}_backbone")
+
+
+def backbone_checkpoint_path(job: Job) -> Path:
+    return backbone_out_dir(job) / "best_checkpoint.pt"
+
+
+def configure_common_paths(cfg: dict[str, Any], *, job: Job) -> None:
     cfg.setdefault("exp", {})
-    cfg["exp"]["name"] = f"{job.dataset}_H{job.horizon}_learnable_anchor_full"
-    cfg["exp"]["out_dir"] = job.out_dir.as_posix()
     cfg["exp"]["device"] = str(job.device)
 
     cfg.setdefault("window", {})
@@ -156,11 +159,63 @@ def configure_run(
     cfg.setdefault("memory", {})
     cfg["memory"]["path"] = (job.out_dir / "cluster_memory.pt").as_posix()
     cfg["memory"]["checkpoint_path"] = (job.out_dir / "best_checkpoint.pt").as_posix()
+
+
+def configure_backbone_run(base_cfg: dict[str, Any], *, job: Job) -> dict[str, Any]:
+    backbone_job = replace(
+        job,
+        config_path=backbone_config_path(job),
+        out_dir=backbone_out_dir(job),
+    )
+    cfg = copy.deepcopy(base_cfg)
+    configure_common_paths(cfg, job=backbone_job)
+    cfg["exp"]["name"] = f"{job.dataset}_H{job.horizon}_backbone_full"
+    cfg["exp"]["out_dir"] = backbone_job.out_dir.as_posix()
+    cfg["finetune"] = {"enable": False}
+    cfg.setdefault("train", {})
+    cfg["train"]["freeze_backbone"] = False
+    cfg.setdefault("moe", {})
+    cfg["moe"]["enable"] = False
+    cfg["moe"]["freeze_backbone"] = False
+    cfg["moe"]["learnable_output_anchor_refiner"] = {"enable": False}
+    cfg.setdefault("eval", {})
+    cfg["eval"]["skip_test"] = True
+    cfg.setdefault("memory", {})
+    cfg["memory"]["save_checkpoint"] = True
+    cfg["memory"]["checkpoint_path"] = backbone_checkpoint_path(job).as_posix()
+    return cfg
+
+
+def configure_run(
+    base_cfg: dict[str, Any],
+    *,
+    job: Job,
+    skip_test: bool,
+    disable_pred_side_residual: bool,
+) -> dict[str, Any]:
+    cfg = copy.deepcopy(base_cfg)
+    configure_common_paths(cfg, job=job)
+    cfg["exp"]["name"] = f"{job.dataset}_H{job.horizon}_learnable_anchor_full"
+    cfg["exp"]["out_dir"] = job.out_dir.as_posix()
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = bool(skip_test)
+    cfg["finetune"] = {
+        "enable": True,
+        "checkpoint_path": backbone_checkpoint_path(job).as_posix(),
+        "strict_window": True,
+        "strict_model": True,
+        "cluster_map": "index",
+        "load_model": True,
+        "load_gate": False,
+        "load_dynamic_lambda": False,
+        "load_learnable_lambda": False,
+    }
+    cfg.setdefault("train", {})
+    cfg["train"]["freeze_backbone"] = True
 
     cfg.setdefault("moe", {})
     cfg["moe"]["enable"] = True
+    cfg["moe"]["freeze_backbone"] = True
     if disable_pred_side_residual:
         cfg["moe"].setdefault("pred_side_residual", {})
         cfg["moe"]["pred_side_residual"]["enable"] = False
@@ -284,13 +339,15 @@ def prepare_configs(
         formatted = "\n".join(str(path) for path in missing)
         raise FileNotFoundError(f"Missing base configs:\n{formatted}")
     for job in jobs:
-        cfg = configure_run(
+        backbone_cfg = configure_backbone_run(read_yaml(job.base_config_path), job=job)
+        write_yaml(backbone_config_path(job), backbone_cfg)
+        stage2_cfg = configure_run(
             read_yaml(job.base_config_path),
             job=job,
             skip_test=skip_test,
             disable_pred_side_residual=disable_pred_side_residual,
         )
-        write_yaml(job.config_path, cfg)
+        write_yaml(job.config_path, stage2_cfg)
 
 
 def run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict[str, Any]:
@@ -300,7 +357,7 @@ def run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict[s
 
     job.out_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{job.dataset}_H{job.horizon}.log"
+    log_path = log_dir / f"{job.dataset}_{job.config_path.stem}.log"
     start = time.time()
     env = run_environment_for_job(job)
     cmd = [python_exe, "-m", "src.train", "--config", str(job.config_path)]
@@ -333,6 +390,27 @@ def run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict[s
     row = row_from_summary(job, status="ok", returncode=proc.returncode)
     row["total_sec"] = row.get("total_sec") or round(time.time() - start, 3)
     return row
+
+
+def run_two_stage_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict[str, Any]:
+    if resume and completed_summary(job.out_dir / "run_summary.json"):
+        return row_from_summary(job, status="skipped")
+
+    backbone_job = replace(
+        job,
+        config_path=backbone_config_path(job),
+        out_dir=backbone_out_dir(job),
+    )
+    backbone_row = run_job(backbone_job, python_exe=python_exe, resume=resume, log_dir=log_dir)
+    if backbone_row.get("status") not in {"ok", "skipped"}:
+        return row_from_summary(
+            job,
+            status="failed",
+            returncode=int(backbone_row.get("returncode") or 1),
+            error=f"backbone stage failed: {backbone_row.get('error', '')}",
+        )
+
+    return run_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
 
 
 def os_environ_utf8() -> dict[str, str]:
@@ -380,7 +458,7 @@ def run_assigned(
                             elapsed_s=time.time() - started_at,
                         )
                     )
-            row = run_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
+            row = run_two_stage_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
             row["worker"] = worker_key
             worker_rows.append(row)
             with rows_lock:
@@ -443,9 +521,10 @@ def main() -> None:
             row["worker"] = worker_key
             plan_rows.append(row)
     write_rows(summary_path, plan_rows)
-    print(f"Generated {len(jobs)} configs under {out_root / 'configs'}")
+    print(f"Generated {len(jobs)} backbone configs and {len(jobs)} stage2 configs under {out_root / 'configs'}")
     print(f"Summary: {summary_path}")
     print(f"Devices: {', '.join(devices)}; workers/device={args.workers_per_device}")
+    print("Training mode: two-stage (backbone checkpoint first, then frozen-backbone PKR-MoE + anchor)")
     if args.dry_run:
         return
     rows = run_assigned(
