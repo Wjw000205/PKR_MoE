@@ -4366,3 +4366,11 @@ Hand back the report and STOP. Do not start a follow-up without me.
     on the dry-run full-matrix summary with `--allow-incomplete` produced `incomplete: 40`, proving
     planned jobs are not counted as successful. After server training finishes, run:
     `python scripts\analyze_full_learnable_anchor_matrix.py --summary outputs\full_learnable_anchor_matrix_20260627\summary.csv`.
+    Follow-up: the analyzer now also accepts `--baseline-summary <csv>` keyed by `dataset,horizon`
+    with `val_mse/val_mae`, `baseline_val_mse/baseline_val_mae`, or `val_static_mse/val_static_mae`
+    columns. With a baseline file provided, a job must pass both checks: refined vs same-run static
+    anchor and refined vs external/current baseline. It normalizes dataset case and can infer
+    horizons such as `H96` from `config_path`, `summary_path`, or `out_dir`, so the existing H96
+    screen summary can be used directly as a baseline-format smoke check. Validation:
+    `python scripts\analyze_full_learnable_anchor_matrix.py --summary outputs\learnable_anchor_multi_h96\summary.csv --baseline-summary outputs\learnable_anchor_multi_h96\summary.csv --out-dir outputs\learnable_anchor_multi_h96\analysis_baseline_check`
+    -> `pass: 5`, `regressed: 0`, `missing_baseline: 0`.
