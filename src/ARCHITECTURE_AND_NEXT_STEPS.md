@@ -4355,3 +4355,14 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `python scripts\run_full_learnable_anchor_matrix.py --out-root outputs\full_learnable_anchor_matrix_20260627 --devices cuda:0,cuda:2,cuda:5 --workers-per-device 2 --resume`.
     Add `--skip-test` for val-only discipline; omit it only for an intentional full train+test
     pass.
+  - Full matrix non-regression analyzer (2026-06-27): added
+    `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
+    It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
+    nonzero if any completed job lacks learnable-anchor metrics or regresses on val MSE/MAE versus
+    the same run's static-anchor metrics (`learnable_val_refined_*` vs `learnable_val_static_*`).
+    It also accepts the older H96 screen summary field names (`val_static_*`, `val_refined_*`), so
+    existing evidence can be checked the same way. Validation: running it on
+    `outputs\learnable_anchor_multi_h96\summary.csv` produced `pass: 5`, `regressed: 0`; running it
+    on the dry-run full-matrix summary with `--allow-incomplete` produced `incomplete: 40`, proving
+    planned jobs are not counted as successful. After server training finishes, run:
+    `python scripts\analyze_full_learnable_anchor_matrix.py --summary outputs\full_learnable_anchor_matrix_20260627\summary.csv`.
