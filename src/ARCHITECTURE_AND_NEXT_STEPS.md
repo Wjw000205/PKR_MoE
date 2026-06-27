@@ -4204,3 +4204,129 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `outputs/codex_table_target_20260614/input96_olinear_filtered_comparison.md` DUET
     columns for PEMS03/04/07/08, recompute averages and red/blue rank counts, then record
     final metrics here.
+  - Electricity parameter-search runner added (2026-06-26): created
+    `scripts/run_electricity_param_search.py` for server-side fixed-input-96 Electricity
+    hyperparameter search. Default search protocol is val-only (`eval.skip_test:true`) and
+    ranks by `val.avg_mse`; final test read requires explicit `--phase final`. Default
+    scheduling uses four concurrent workers across the user-reported free A100s:
+    `cuda:0#1`, `cuda:2#1`, `cuda:0#2`, `cuda:2#2` (`--devices cuda:0,cuda:2
+    --workers-per-device 2`). The seed candidates stay within already-used Electricity/MLP
+    families and existing residual/penalty controls rather than introducing new model code.
+    Local verification only ran unit tests, `py_compile`, and dry-run config/assignment
+    generation; no real Electricity training was started locally. Server command for the
+    full val search: `python scripts/run_electricity_param_search.py --phase search
+    --horizons 96,192,336,720 --devices cuda:0,cuda:2 --workers-per-device 2
+    --out-root outputs/electricity_param_search_20260626`. After the search finishes,
+    inspect `search_ranking.md` and then run `--phase final` once to read test for the
+    val-selected candidate per horizon.
+  - Learnable anchor exploration kickoff (2026-06-27): inspected the current output-side
+    statistical anchor path for a possible static-to-learnable conversion. Current
+    `moe.train_stat_anchor_expert` and `moe.train_residual_anchor_expert` are not modules:
+    train-only phase tables are built in `src/train.py`, then channel or channel-horizon
+    alpha values are selected by val/train scale sweeps and written into the mutable config
+    dict before eval. Because the training loop optimizes one per-cluster parameter group,
+    a learnable replacement must be explicit `nn.Module` state with per-cluster parameter
+    ownership, checkpoint state, and `mask_cluster_grads` integration; directly turning the
+    existing anchor tables or alpha config values into tensors would bypass optimizer and
+    checkpoint semantics. Non-regression design constraint: keep any learnable anchor
+    default-off and add an identity/static-initialized mode that reproduces the current
+    static anchor path before running val-only experiments. Recommended first diagnostic:
+    implement a tiny static-equivalent learnable wrapper and verify disabled/static
+    equivalence with unit tests before trying any val-only training run.
+  - Learnable output-anchor refiner copy result (2026-06-27): per user instruction, all
+    implementation lived only in the worktree copy
+    `F:\Python program\MoELoss-learnable-anchor-copy-20260627` on branch
+    `codex/learnable-anchor-copy-20260627`; root source code was not migrated. The copy
+    added a default-off, zero-delta-initialized per-cluster output-anchor refiner after the
+    existing static output/stat/residual anchors. Verification in the copy passed:
+    `python -m pytest tests\test_learnable_output_anchor.py -q` -> 6 passed;
+    `python -m pytest tests\test_history_anchor_adapter.py tests\test_pred_residual_anchor_wiring.py tests\test_learnable_output_anchor.py -q`
+    -> 118 passed, 1 existing small-std warning; `python -m py_compile
+    src\models\learnable_anchor.py src\train.py` passed. Controlled Weather-H96 diagnostics
+    used the retained root checkpoint and root data file but wrote outputs under the copy.
+    MSE-only refiner loss (`configs\diagnostics\weather_H96_learnable_anchor_valonly.yaml`,
+    3 epochs) improved val MSE but regressed val MAE, so the no-MAE-regression gate rejected
+    it: static `0.371409/0.257992`, refined `0.369241/0.266132`. Diagnosis:
+    optimizer/selection objective mismatch, not eval-path wiring. The next val-only run
+    changed only the refiner loss to `MSE + 1.0*MAE`
+    (`configs\diagnostics\weather_H96_learnable_anchor_mae1_valonly.yaml`) and adopted on val:
+    static `0.371409/0.257992`, refined `0.370149/0.251845` (MSE -0.34%, MAE -2.38%).
+    A single fixed test-once confirmation
+    (`configs\diagnostics\weather_H96_learnable_anchor_mae1_test_once.yaml`) showed a
+    tradeoff rather than no-regression: root static Weather-H96 baseline is
+    `0.152374/0.216072`, learnable refiner test is `0.154198/0.211666` (MSE +1.20%,
+    MAE -2.04%). Verdict: do not migrate this implementation to root as the static-anchor
+    replacement; it is a real MAE improver but fails exact-MSE non-regression. Classify as
+    train-val/test shift plus selection-policy mismatch. If continuing, the next smallest
+    action should be val-only only: add a train-holdout/no-regret stability guard or a stricter
+    val MSE margin before any future test read.
+  - Learnable output-anchor channel adoption success (2026-06-27): continued after the user asked
+    to try lowering MSE. Root cause analysis of the failed global-refiner test showed the MSE
+    regression was channel-local: cluster1 worsened on both val and test, while the global adoption
+    gate hid those regressions behind larger gains elsewhere. Added a default-off channel-level
+    adoption mask in the copy: `adoption_scope: channel` keeps the trained refiner but falls back to
+    the static anchor for channels whose val MSE does not improve and whose val MAE would regress.
+    New tests in the copy verified mask fallback and trainer channel-gate behavior; copy regression
+    check passed: `python -m pytest tests\test_history_anchor_adapter.py
+    tests\test_pred_residual_anchor_wiring.py tests\test_learnable_output_anchor.py -q` -> 120
+    passed, 1 existing small-std warning; `py_compile` passed. Controlled Weather-H96 val-only
+    config `configs\diagnostics\weather_H96_learnable_anchor_mae1_channel_valonly.yaml` changed
+    only `adoption_scope: channel` on top of the previous `MSE+MAE` refiner: static val
+    `0.371409/0.257992`, unmasked refined val `0.370149/0.251845`, masked refined val
+    `0.368360/0.248983` with 11/21 channels adopted. One fixed test-once run
+    `configs\diagnostics\weather_H96_learnable_anchor_mae1_channel_test_once.yaml` then improved
+    over the root static Weather-H96 baseline `0.152374/0.216072` to `0.151548/0.207549`.
+    Adopted this mechanism into root source and enabled it only for `configs/weather_H96.yaml` and
+    alias `configs/weather.yaml` with `hidden_dim:16`, `epochs:3`, `lr:0.001`, `mae_weight:1.0`,
+    `selection_metric:mse`, and `adoption_scope:channel`. Root verification:
+    `python -m pytest tests\test_learnable_output_anchor.py -q` -> 8 passed; related anchor
+    regression -> 120 passed, 1 existing warning; `python -m src.train --config
+    configs\weather_H96.yaml` reproduced val `0.368360/0.248983` and test `0.151548/0.207549`.
+    Scope warning: this is only validated for Weather-H96; do not enable the learnable output-anchor
+    refiner on other horizons/datasets without val-only evidence first.
+  - Learnable output-anchor multi-dataset H96 screen (2026-06-27, val-only except Weather):
+    user requested a multi-dataset look. ETT H96 configs were not included in this first screen
+    because they currently enable `pred_side_residual`, and the post-hoc refiner trainer is still
+    scoped to the output-anchor-only path; supporting ETT requires a separate eval-path/trainer
+    wiring task. Electricity/Traffic H96 configs have no `finetune.checkpoint_path`, so they would
+    rerun training and were also excluded from this lightweight checkpoint screen. Generated
+    diagnostic configs under `configs/diagnostics/*_H96_learnable_anchor_channel_evalonly.yaml`
+    for PEMS03/04/07/08 by keeping the dataset/model/checkpoint fixed, setting
+    `train.epochs:1`, `train.lr:0`, `eval.skip_test:true`, and enabling the same
+    `learnable_output_anchor_refiner` recipe (`hidden_dim:16`, `epochs:3`, `lr:0.001`,
+    `mae_weight:1.0`, `selection_metric:mse`, `adoption_scope:channel`). These are checkpoint
+    eval-only screens, not replacements for the formal 36-epoch PEMS stage-2 configs. Results were
+    summarized in `outputs/learnable_anchor_multi_h96/summary.csv`:
+    - Weather-H96 formal run: val `0.371409/0.257992 -> 0.368360/0.248983` (-0.82% MSE,
+      -3.49% MAE), test `0.152374/0.216072 -> 0.151548/0.207549`, 11/21 channels adopted.
+    - PEMS03-H96 eval-only: val `0.096851/0.215122 -> 0.095364/0.212633` (-1.54% MSE,
+      -1.16% MAE), 342/358 channels adopted; no test read.
+    - PEMS04-H96 eval-only: val `0.089962/0.202039 -> 0.089054/0.200735` (-1.01% MSE,
+      -0.65% MAE), 205/307 channels adopted; no test read.
+    - PEMS07-H96 eval-only: val `0.094326/0.203542 -> 0.092565/0.201440` (-1.87% MSE,
+      -1.03% MAE), 735/883 channels adopted; no test read. Local CPU cost was high
+      (`~816s`, `~10GB` RSS), so run future PEMS07 screens on GPU/server when possible.
+    - PEMS08-H96 eval-only: val `0.155276/0.236368 -> 0.151824/0.232899` (-2.22% MSE,
+      -1.47% MAE), 154/170 channels adopted; no test read.
+    Verdict: the channel-gated learnable output anchor is not Weather-only; it shows consistent
+    val double-improvement on all four PEMS H96 checkpoint screens. Next smallest defensible action,
+    if formal adoption is desired, is to run one full PEMS H96 formal val-only config first
+    (starting with the cheapest/strongest PEMS08-H96), then do a single test-once only if that
+    full val run improves over the corresponding formal baseline. Do not directly enable the
+    refiner in all PEMS root configs from the eval-only screens.
+  - PEMS08-H96 formal learnable-anchor validation (2026-06-27): ran the recommended full formal
+    PEMS08-H96 val-only config
+    `configs/diagnostics/PEMS08_H96_learnable_anchor_formal_valonly.yaml`, derived from root
+    `configs/PEMS08_H96.yaml` with the same 36-epoch schedule and only `eval.skip_test:true` plus
+    the channel-gated learnable output anchor enabled. It early-stopped at epoch 8 / selected
+    epoch 4 and adopted 136/170 channels. Val improved over the existing formal baseline
+    `outputs/pems_residual_fullhorizon_20260620/runs/PEMS08_H96/run_summary.json`
+    (`0.154964/0.235096`) to `0.152579/0.233683`; within the run, static-anchor val was
+    `0.155276/0.236368` and refined val was `0.152580/0.233683`. Because the formal val result was
+    positive, ran one fixed test-once
+    `configs/diagnostics/PEMS08_H96_learnable_anchor_formal_test_once.yaml` with only
+    `eval.skip_test:false` and a separate output dir. Test improved from the existing formal
+    baseline `0.116705/0.223256` to `0.115175/0.222078` (MSE -1.31%, MAE -0.53%). Adopted the
+    same learnable-anchor block into root `configs/PEMS08_H96.yaml`. Do not tune further on this
+    PEMS08 test read; next PEMS action should be a separate formal val-only run for another horizon
+    or dataset, not a PEMS08 hyperparameter adjustment.

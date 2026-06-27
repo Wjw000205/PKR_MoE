@@ -47,6 +47,7 @@ from .utils.pearson import pearson_corr_matrix
 from .utils.clustering import cluster_channels_by_corr
 from .models.cluster_predictor import build_cluster_predictor
 from .models.dynamic_lambda import ClusterwiseDynamicLambda
+from .models.learnable_anchor import ClusterwiseLearnableOutputAnchorRefiner
 from .models.learnable_lambda import ClusterwiseLearnableLambda
 from .models.moe_gate import ClusterwiseMoEGate, scatter_mean_bc_to_bk, scatter_mean_bcf_to_bkf
 from .models.penalties import build_penalty_bank, normalize_penalties
@@ -3500,6 +3501,374 @@ def select_train_residual_anchor_scales_from_loader(
 
 
 @torch.no_grad()
+def _learnable_output_anchor_static_batch(
+    *,
+    model: nn.Module,
+    x_bcl: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    moe_cfg: dict,
+    history_anchor_cfg: Optional[dict],
+    observed_history_tc: Optional[torch.Tensor],
+    input_len: int,
+    model_train_stat_adapter_pc: Optional[torch.Tensor],
+    model_train_stat_adapter_cfg: Optional[dict],
+    train_stat_anchor_pc: Optional[torch.Tensor],
+    train_residual_anchor_phc: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_model = apply_train_stat_input_centering(
+        x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        stat_anchor_pc=model_train_stat_adapter_pc,
+        cfg=model_train_stat_adapter_cfg,
+    )
+    y_base_raw = model(x_model, cluster_id_c)
+    y_base = apply_history_anchor_adapter(
+        y_base_raw,
+        base_pred_bch=y_base_raw,
+        observed_history_tc=observed_history_tc,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len or x_bcl.shape[-1]),
+        cfg=history_anchor_cfg,
+    )
+    y_base = apply_train_stat_anchor_expert(
+        y_base,
+        base_pred_bch=y_base,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len or x_bcl.shape[-1]),
+        stat_anchor_pc=model_train_stat_adapter_pc,
+        cfg=model_train_stat_adapter_cfg,
+    )
+    y_static = apply_moe_output_anchor_experts(
+        y_base,
+        base_pred_bch=y_base,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len or x_bcl.shape[-1]),
+        moe_cfg=moe_cfg,
+        moe_enable=bool((moe_cfg or {}).get("enable", True)),
+        observed_history_tc=observed_history_tc,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+    )
+    return y_base.detach(), y_static.detach()
+
+
+@torch.no_grad()
+def _evaluate_learnable_output_anchor_refiner(
+    *,
+    model: nn.Module,
+    refiner: Optional[ClusterwiseLearnableOutputAnchorRefiner],
+    loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    moe_cfg: dict,
+    device: torch.device,
+    input_len: int,
+    eval_start: int = 0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    model.eval()
+    if refiner is not None:
+        refiner.eval()
+    static_se = refined_se = static_ae = refined_ae = 0.0
+    static_se_c = refined_se_c = static_ae_c = refined_ae_c = None
+    count_c = None
+    denom = 0
+    for x, y, idx in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+        query_start_abs_b = int(eval_start) + idx
+        y_base, y_static = _learnable_output_anchor_static_batch(
+            model=model,
+            x_bcl=x,
+            query_start_abs_b=query_start_abs_b,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            input_len=input_len,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        y_refined = y_static
+        if refiner is not None:
+            y_refined = refiner(
+                x_bcl=x,
+                base_pred_bch=y_base,
+                static_pred_bch=y_static,
+                cluster_id_c=cluster_id_c,
+            )
+        static_err = y_static - y
+        refined_err = y_refined - y
+        static_se += float(static_err.pow(2).sum().item())
+        refined_se += float(refined_err.pow(2).sum().item())
+        static_ae += float(static_err.abs().sum().item())
+        refined_ae += float(refined_err.abs().sum().item())
+        batch_static_se_c = static_err.pow(2).sum(dim=(0, 2)).detach().cpu()
+        batch_refined_se_c = refined_err.pow(2).sum(dim=(0, 2)).detach().cpu()
+        batch_static_ae_c = static_err.abs().sum(dim=(0, 2)).detach().cpu()
+        batch_refined_ae_c = refined_err.abs().sum(dim=(0, 2)).detach().cpu()
+        batch_count_c = torch.full(
+            (int(y.shape[1]),),
+            int(y.shape[0]) * int(y.shape[2]),
+            dtype=torch.float64,
+        )
+        if static_se_c is None:
+            static_se_c = batch_static_se_c.to(torch.float64)
+            refined_se_c = batch_refined_se_c.to(torch.float64)
+            static_ae_c = batch_static_ae_c.to(torch.float64)
+            refined_ae_c = batch_refined_ae_c.to(torch.float64)
+            count_c = batch_count_c
+        else:
+            static_se_c += batch_static_se_c.to(torch.float64)
+            refined_se_c += batch_refined_se_c.to(torch.float64)
+            static_ae_c += batch_static_ae_c.to(torch.float64)
+            refined_ae_c += batch_refined_ae_c.to(torch.float64)
+            count_c += batch_count_c
+        denom += int(y.numel())
+    denom = max(int(denom), 1)
+    if count_c is None:
+        count_c = torch.ones(0, dtype=torch.float64)
+        static_se_c = refined_se_c = static_ae_c = refined_ae_c = torch.zeros(0, dtype=torch.float64)
+    count_c = count_c.clamp_min(1.0)
+    return {
+        "static_mse": static_se / denom,
+        "static_mae": static_ae / denom,
+        "refined_mse": refined_se / denom,
+        "refined_mae": refined_ae / denom,
+        "static_mse_c": (static_se_c / count_c).tolist(),
+        "static_mae_c": (static_ae_c / count_c).tolist(),
+        "refined_mse_c": (refined_se_c / count_c).tolist(),
+        "refined_mae_c": (refined_ae_c / count_c).tolist(),
+    }
+
+
+def train_learnable_output_anchor_refiner(
+    *,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    input_len: int,
+    channel_count: int,
+    cfg: Optional[dict],
+    train_eval_start: int = 0,
+    val_eval_start: int = 0,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[ClusterwiseLearnableOutputAnchorRefiner], Dict[str, object]]:
+    cfg = cfg or {}
+    summary: Dict[str, object] = {"enable": bool(cfg.get("enable", False))}
+    if not bool(cfg.get("enable", False)):
+        summary["reason"] = "disabled"
+        return None, summary
+    if len(train_loader) <= 0 or len(val_loader) <= 0:
+        summary["reason"] = "empty_train_or_val_loader"
+        summary["adopted"] = False
+        return None, summary
+
+    model.eval()
+    target_horizon = int(next(iter(val_loader))[1].shape[-1])
+    refiner = ClusterwiseLearnableOutputAnchorRefiner(
+        num_clusters=int(K),
+        pred_len=int(cfg.get("pred_len", 0) or target_horizon),
+        num_channels=int(channel_count),
+        cluster_id_c=cluster_id_c.detach().cpu(),
+        hidden_dim=int(cfg.get("hidden_dim", 16)),
+        max_delta_scale=float(cfg.get("max_delta_scale", 1.0)),
+        init=str(cfg.get("init", "zero_delta")),
+    ).to(device)
+    if refiner.H != target_horizon:
+        raise ValueError("learnable_output_anchor_refiner pred_len must match loader target horizon.")
+
+    epochs = max(0, int(cfg.get("epochs", 20)))
+    lr = float(cfg.get("lr", 1.0e-3))
+    weight_decay = float(cfg.get("weight_decay", 0.0))
+    mae_weight = float(cfg.get("mae_weight", 0.0))
+    selection_metric = str(cfg.get("selection_metric", "mse")).lower()
+    if selection_metric not in {"mse", "mae"}:
+        raise ValueError("learnable_output_anchor_refiner.selection_metric must be mse or mae.")
+    adoption_scope = str(cfg.get("adoption_scope", "global")).lower()
+    if adoption_scope not in {"global", "channel"}:
+        raise ValueError("learnable_output_anchor_refiner.adoption_scope must be global or channel.")
+
+    initial_metrics = _evaluate_learnable_output_anchor_refiner(
+        model=model,
+        refiner=None,
+        loader=val_loader,
+        cluster_id_c=cluster_id_c,
+        moe_cfg=moe_cfg,
+        device=device,
+        input_len=input_len,
+        eval_start=val_eval_start,
+        history_anchor_cfg=history_anchor_cfg,
+        observed_history_tc=observed_history_tc,
+        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+        train_stat_anchor_pc=train_stat_anchor_pc,
+        train_residual_anchor_phc=train_residual_anchor_phc,
+    )
+    best_metric = float(initial_metrics[f"static_{selection_metric}"])
+    best_state = {name: value.detach().cpu().clone() for name, value in refiner.state_dict().items()}
+    best_metrics = dict(initial_metrics)
+    best_epoch = 0
+
+    optimizer = torch.optim.Adam(refiner.parameters(), lr=lr, weight_decay=weight_decay)
+    for epoch in range(1, epochs + 1):
+        refiner.train()
+        for x, y, idx in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
+            query_start_abs_b = int(train_eval_start) + idx
+            y_base, y_static = _learnable_output_anchor_static_batch(
+                model=model,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                cluster_id_c=cluster_id_c,
+                moe_cfg=moe_cfg,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=observed_history_tc,
+                input_len=input_len,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+            pred = refiner(
+                x_bcl=x,
+                base_pred_bch=y_base,
+                static_pred_bch=y_static,
+                cluster_id_c=cluster_id_c,
+            )
+            mse = (pred - y).pow(2).mean()
+            mae = (pred - y).abs().mean()
+            loss = mse + mae_weight * mae
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            refiner.mask_cluster_grads(torch.zeros(int(K), device=device, dtype=torch.bool))
+            optimizer.step()
+
+        metrics = _evaluate_learnable_output_anchor_refiner(
+            model=model,
+            refiner=refiner,
+            loader=val_loader,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            device=device,
+            input_len=input_len,
+            eval_start=val_eval_start,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+        metric_value = float(metrics[f"refined_{selection_metric}"])
+        if metric_value < best_metric:
+            best_metric = metric_value
+            best_metrics = dict(metrics)
+            best_epoch = int(epoch)
+            best_state = {name: value.detach().cpu().clone() for name, value in refiner.state_dict().items()}
+
+    refiner.load_state_dict({name: value.to(device) for name, value in best_state.items()}, strict=True)
+    unmasked_best_metrics = dict(best_metrics)
+    static_metric = float(initial_metrics[f"static_{selection_metric}"])
+    min_abs = float(cfg.get("min_abs_improvement", 0.0))
+    min_rel = float(cfg.get("min_rel_improvement", 0.0))
+    required = max(max(0.0, min_abs), max(0.0, min_rel) * abs(static_metric))
+    max_rel_mae_regression = float(cfg.get("max_rel_mae_regression", 0.0))
+    adopted_channel_mask = None
+    if adoption_scope == "channel":
+        static_metric_c = torch.tensor(initial_metrics[f"static_{selection_metric}_c"], dtype=torch.float64)
+        refined_metric_c = torch.tensor(unmasked_best_metrics[f"refined_{selection_metric}_c"], dtype=torch.float64)
+        static_mae_c = torch.tensor(initial_metrics["static_mae_c"], dtype=torch.float64)
+        refined_mae_c = torch.tensor(unmasked_best_metrics["refined_mae_c"], dtype=torch.float64)
+        required_c = torch.maximum(
+            torch.full_like(static_metric_c, max(0.0, min_abs)),
+            max(0.0, min_rel) * static_metric_c.abs(),
+        )
+        metric_gain_c = static_metric_c - refined_metric_c
+        mae_regression_c = refined_mae_c - static_mae_c
+        mae_allowed_c = mae_regression_c <= max(0.0, max_rel_mae_regression) * static_mae_c.abs().clamp_min(1.0e-12)
+        adopted_channel_mask = (metric_gain_c > required_c) & mae_allowed_c
+        refiner.set_channel_adoption_mask(adopted_channel_mask.to(device=device))
+        best_metrics = _evaluate_learnable_output_anchor_refiner(
+            model=model,
+            refiner=refiner,
+            loader=val_loader,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            device=device,
+            input_len=input_len,
+            eval_start=val_eval_start,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+    refined_metric = float(best_metrics[f"refined_{selection_metric}"])
+    metric_gain = static_metric - refined_metric
+    mae_regression = float(best_metrics["refined_mae"] - initial_metrics["static_mae"])
+    mae_allowed = mae_regression <= max(0.0, max_rel_mae_regression) * max(abs(float(initial_metrics["static_mae"])), 1.0e-12)
+    adopted = bool(metric_gain > required and mae_allowed)
+    if adoption_scope == "channel":
+        adopted = bool(adopted and adopted_channel_mask is not None and bool(adopted_channel_mask.any().item()))
+    summary.update(
+        {
+            "adopted": adopted,
+            "adoption_scope": adoption_scope,
+            "selection_metric": selection_metric,
+            "best_epoch": int(best_epoch),
+            "epochs": int(epochs),
+            "lr": float(lr),
+            "weight_decay": float(weight_decay),
+            "hidden_dim": int(cfg.get("hidden_dim", 16)),
+            "max_delta_scale": float(cfg.get("max_delta_scale", 1.0)),
+            "val_static_mse": float(initial_metrics["static_mse"]),
+            "val_static_mae": float(initial_metrics["static_mae"]),
+            "val_refined_mse": float(best_metrics["refined_mse"]),
+            "val_refined_mae": float(best_metrics["refined_mae"]),
+            "metric_gain": float(metric_gain),
+            "required_gain": float(required),
+            "mae_regression": float(mae_regression),
+        }
+    )
+    if adoption_scope == "channel" and adopted_channel_mask is not None:
+        summary.update(
+            {
+                "adopted_channel_mask": [bool(v) for v in adopted_channel_mask.detach().cpu().tolist()],
+                "adopted_channel_count": int(adopted_channel_mask.sum().item()),
+                "val_refined_mse_unmasked": float(unmasked_best_metrics["refined_mse"]),
+                "val_refined_mae_unmasked": float(unmasked_best_metrics["refined_mae"]),
+            }
+        )
+    if not adopted:
+        summary["reason"] = "val_gate_rejected"
+        return None, summary
+    return refiner, summary
+
+
+@torch.no_grad()
 def eval_loop(
     model: nn.Module,
     gate: ClusterwiseMoEGate,
@@ -3530,6 +3899,7 @@ def eval_loop(
     pred_residual: Optional[ClusterwisePredResidualMoE] = None,
     pred_residual_selector: Optional[nn.Module] = None,
     pred_residual_scale_c: Optional[torch.Tensor] = None,
+    learnable_output_anchor_refiner: Optional[nn.Module] = None,
     eval_start: int = 0,
     history_anchor_cfg: Optional[dict] = None,
     observed_history_tc: Optional[torch.Tensor] = None,
@@ -3548,6 +3918,8 @@ def eval_loop(
         dynamic_lambda.eval()
     if pred_residual is not None:
         pred_residual.eval()
+    if learnable_output_anchor_refiner is not None:
+        learnable_output_anchor_refiner.eval()
 
     moe_enable = bool(moe_cfg.get("enable", True))
     allow_skip = bool(moe_cfg.get("allow_skip", False)) and moe_enable
@@ -3705,6 +4077,13 @@ def eval_loop(
                 observed_history_tc=observed_history_tc,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+        if learnable_output_anchor_refiner is not None:
+            yhat = learnable_output_anchor_refiner(
+                x_bcl=x,
+                base_pred_bch=yhat_base,
+                static_pred_bch=yhat,
+                cluster_id_c=cluster_id_c,
             )
 
         yhat = apply_calendar_residual_correction(
@@ -13134,6 +13513,13 @@ def main():
     pred_residual_selector_model = None
     pred_residual_selector_summary = None
     pred_residual_selection_summary = None
+    learnable_output_anchor_cfg = moe_cfg.get("learnable_output_anchor_refiner", {}) or {}
+    if not isinstance(learnable_output_anchor_cfg, dict):
+        learnable_output_anchor_cfg = {"enable": bool(learnable_output_anchor_cfg)}
+    learnable_output_anchor_refiner_model = None
+    learnable_output_anchor_summary: Dict[str, object] = {
+        "enable": bool(learnable_output_anchor_cfg.get("enable", False)),
+    }
     moe_gate_penalty_hit_summary = None
     penalty_explainability_summary = None
     penalty_route_learnability_summary = None
@@ -13928,6 +14314,96 @@ def main():
                     f"adopted={bool(selector_adoption['adopt'])}, "
                     f"holdout_gain={((pred_residual_selector_summary or {}).get('holdout') or {}).get('selected_gain_pct_vs_base')}"
                 )
+        if bool(learnable_output_anchor_cfg.get("enable", False)):
+            if pred_residual is not None:
+                learnable_output_anchor_summary.update(
+                    {
+                        "adopted": False,
+                        "reason": "unsupported_with_pred_side_residual",
+                    }
+                )
+                print("Learnable output-anchor refiner skipped: pred_side_residual path is enabled.")
+            else:
+                refiner_train_loader = DataLoader(
+                    dtr,
+                    batch_size=int(cfg["train"]["batch_size"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=pin_mem,
+                )
+                learnable_output_anchor_refiner_model, learnable_output_anchor_summary = (
+                    train_learnable_output_anchor_refiner(
+                        model=model,
+                        train_loader=refiner_train_loader,
+                        val_loader=val_loader_summary,
+                        cluster_id_c=cluster_id_c,
+                        K=K,
+                        moe_cfg=moe_cfg,
+                        device=device,
+                        input_len=L,
+                        channel_count=C,
+                        cfg=learnable_output_anchor_cfg,
+                        train_eval_start=0,
+                        val_eval_start=val_eval_start,
+                        history_anchor_cfg=history_anchor_cfg,
+                        observed_history_tc=data_window_tc,
+                        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                        train_stat_anchor_pc=train_stat_anchor_pc,
+                        train_residual_anchor_phc=train_residual_anchor_phc,
+                    )
+                )
+                if learnable_output_anchor_refiner_model is not None:
+                    (
+                        val_refiner_loss_k,
+                        val_refiner_mse_k,
+                        val_refiner_mae_k,
+                        val_refiner_mse_c,
+                        val_refiner_mae_c,
+                        _,
+                        _,
+                        _,
+                    ) = eval_loop_with_history(
+                        model, gate, lam_kp_best,
+                        penalty_names, penalty_fns,
+                        val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                        select_ranks=select_ranks,
+                        collect_plot=False, channel_count=C,
+                        mse_weight=mse_weight,
+                        gate_entropy_weight=gate_entropy_weight,
+                        gate_balance_weight=gate_balance_weight,
+                        gate_soft_weight=gate_soft_weight,
+                        gate_entropy_target_frac=gate_entropy_target_frac,
+                        penalty_scale=penalty_scale,
+                        dynamic_lambda=dynamic_lambda,
+                        lambda_min_kp=lambda_min_kp,
+                        mae_objective_weight=mae_eval_weight,
+                        mae_objective_kind=mae_objective_kind,
+                        mae_objective_beta=mae_objective_beta,
+                        pred_residual=pred_residual,
+                        pred_residual_selector=pred_residual_selector_model,
+                        pred_residual_scale_c=pred_residual_channel_scale_c,
+                        learnable_output_anchor_refiner=learnable_output_anchor_refiner_model,
+                        eval_start=val_eval_start,
+                    )
+                    val_mse_c_base = val_refiner_mse_c
+                    val_mae_c_base = val_refiner_mae_c
+                    val_summary = {
+                        "avg_loss": float(reduce_cluster_metric(val_refiner_loss_k, cluster_weight_k).item()),
+                        "avg_mse": float(reduce_cluster_metric(val_refiner_mse_k, cluster_weight_k).item()),
+                        "avg_mae": float(reduce_cluster_metric(val_refiner_mae_k, cluster_weight_k).item()),
+                        "per_cluster_loss": [float(v) for v in val_refiner_loss_k.detach().cpu().tolist()],
+                        "per_cluster_mse": [float(v) for v in val_refiner_mse_k.detach().cpu().tolist()],
+                        "per_cluster_mae": [float(v) for v in val_refiner_mae_k.detach().cpu().tolist()],
+                        "per_channel_mse": [float(v) for v in val_refiner_mse_c.detach().cpu().tolist()],
+                        "per_channel_mae": [float(v) for v in val_refiner_mae_c.detach().cpu().tolist()],
+                    }
+                print(
+                    "Learnable output-anchor refiner: "
+                    f"adopted={bool(learnable_output_anchor_summary.get('adopted', False))}, "
+                    f"val_static_MSE={float(learnable_output_anchor_summary.get('val_static_mse', 0.0)):.6f}, "
+                    f"val_refined_MSE={float(learnable_output_anchor_summary.get('val_refined_mse', 0.0)):.6f}"
+                )
         gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
         gate_penalty_hit_enable = bool(gate_penalty_hit_cfg.get("enable", True))
         if gate_penalty_hit_enable and pred_residual is not None and moe_enable and P > 0:
@@ -14082,6 +14558,7 @@ def main():
             pred_residual=pred_residual,
             pred_residual_selector=pred_residual_selector_model,
             pred_residual_scale_c=pred_residual_channel_scale_c,
+            learnable_output_anchor_refiner=learnable_output_anchor_refiner_model,
             eval_start=test_eval_start,
             diagnostic_collector=prediction_diag_collector,
         )
@@ -14414,6 +14891,10 @@ def main():
             selected_variant = moe_residual_variant
             selected_criterion = str(pred_residual_selection_summary.get("policy", selected_criterion))
             selected_selection_policy = str(pred_residual_selection_summary.get("policy", selected_selection_policy))
+    if bool(learnable_output_anchor_summary.get("adopted", False)):
+        selected_variant = "learnable_output_anchor_refiner"
+        selected_criterion = "learnable_output_anchor_refiner"
+        selected_selection_policy = "learnable_output_anchor_refiner"
 
     if skip_test:
         val_mse_print = None if val_summary is None else val_summary.get("avg_mse")
@@ -14643,6 +15124,7 @@ def main():
         "model_train_stat_adapter": model_train_stat_adapter_summary,
         "train_stat_anchor_expert": train_stat_anchor_summary,
         "train_residual_anchor_expert": train_residual_anchor_summary,
+        "learnable_output_anchor_refiner": learnable_output_anchor_summary,
         "moe_gate_penalty_hit": moe_gate_penalty_hit_summary,
         "penalty_explainability": penalty_explainability_summary,
         "penalty_route_learnability": penalty_route_learnability_summary,

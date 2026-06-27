@@ -1,6 +1,6 @@
 exp:
-  name: PEMS08_H96
-  out_dir: outputs/PEMS08_H96
+  name: PEMS08_H96_learnable_anchor_formal_test_once
+  out_dir: outputs/learnable_anchor_formal_test_once/PEMS08_H96
   seed: 2026
   deterministic: true
   device: cuda:0
@@ -21,7 +21,7 @@ normalize:
   train_only: true
 corr:
   compute: true
-  save_path: outputs/PEMS08_H96/corr.npy
+  save_path: outputs/learnable_anchor_formal_test_once/PEMS08_H96/corr.npy
 cluster:
   method: leader
   n_clusters: 3
@@ -108,6 +108,8 @@ moe:
     corrector_hidden: 16
     alpha_scale: 0.6
     selection_policy: val_mse_candidate_channel
+  freeze_backbone: true
+  router_penalty_context_score: high_violation
   learnable_output_anchor_refiner:
     enable: true
     hidden_dim: 16
@@ -122,8 +124,6 @@ moe:
     min_abs_improvement: 0.0
     min_rel_improvement: 0.0
     max_rel_mae_regression: 0.0
-  freeze_backbone: true
-  router_penalty_context_score: high_violation
 penalties:
   enabled:
   - amp_under
@@ -157,14 +157,14 @@ plot:
   enable: false
 portrait:
   enable: false
-  out_dir: outputs/PEMS08_H96/cluster_portraits
+  out_dir: outputs/learnable_anchor_formal_test_once/PEMS08_H96/cluster_portraits
 eval:
   skip_test: false
 memory:
   enable: false
   save_checkpoint: false
-  path: outputs/PEMS08_H96/cluster_memory.pt
-  checkpoint_path: outputs/PEMS08_H96/best_checkpoint.pt
+  path: outputs/learnable_anchor_formal_test_once/PEMS08_H96/cluster_memory.pt
+  checkpoint_path: outputs/learnable_anchor_formal_test_once/PEMS08_H96/best_checkpoint.pt
 finetune:
   enable: true
   checkpoint_path: F:\Python program\MoELoss - 20260401\outputs\pems08_h96_backbone_capacity\runs\hid192_b2\best_checkpoint.pt

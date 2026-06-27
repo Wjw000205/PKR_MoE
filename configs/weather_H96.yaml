@@ -133,6 +133,20 @@ moe:
     corrector_hidden: 16
     alpha_scale: 0.6
     selection_policy: val_mse_candidate_channel
+  learnable_output_anchor_refiner:
+    enable: true
+    hidden_dim: 16
+    epochs: 3
+    lr: 0.001
+    weight_decay: 0.0
+    mae_weight: 1.0
+    selection_metric: mse
+    adoption_scope: channel
+    max_delta_scale: 1.0
+    init: zero_delta
+    min_abs_improvement: 0.0
+    min_rel_improvement: 0.0
+    max_rel_mae_regression: 0.0
 
 penalties:
   enabled:

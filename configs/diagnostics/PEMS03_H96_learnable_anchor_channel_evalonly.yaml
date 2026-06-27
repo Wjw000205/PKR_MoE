@@ -1,11 +1,11 @@
 exp:
-  name: PEMS08_H96
-  out_dir: outputs/PEMS08_H96
+  name: PEMS03_H96_learnable_anchor_evalonly
+  out_dir: outputs/learnable_anchor_multi_h96/PEMS03_H96_evalonly
   seed: 2026
   deterministic: true
   device: cuda:0
 data:
-  csv_path: data/PEMS08.csv
+  csv_path: data/PEMS03.csv
   date_col: 0
   train_ratio: 0.7
   val_ratio: 0.1
@@ -21,7 +21,7 @@ normalize:
   train_only: true
 corr:
   compute: true
-  save_path: outputs/PEMS08_H96/corr.npy
+  save_path: outputs/learnable_anchor_multi_h96/PEMS03_H96_evalonly/corr.npy
 cluster:
   method: leader
   n_clusters: 3
@@ -108,6 +108,8 @@ moe:
     corrector_hidden: 16
     alpha_scale: 0.6
     selection_policy: val_mse_candidate_channel
+  freeze_backbone: true
+  router_penalty_context_score: high_violation
   learnable_output_anchor_refiner:
     enable: true
     hidden_dim: 16
@@ -122,8 +124,6 @@ moe:
     min_abs_improvement: 0.0
     min_rel_improvement: 0.0
     max_rel_mae_regression: 0.0
-  freeze_backbone: true
-  router_penalty_context_score: high_violation
 penalties:
   enabled:
   - amp_under
@@ -132,9 +132,9 @@ penalties:
   - direction
   jump_threshold: 0.6
 train:
-  epochs: 36
+  epochs: 1
   batch_size: 64
-  lr: 0.001
+  lr: 0.0
   mse_weight: 0.5
   mae_objective:
     enable: true
@@ -157,17 +157,17 @@ plot:
   enable: false
 portrait:
   enable: false
-  out_dir: outputs/PEMS08_H96/cluster_portraits
+  out_dir: outputs/learnable_anchor_multi_h96/PEMS03_H96_evalonly/cluster_portraits
 eval:
-  skip_test: false
+  skip_test: true
 memory:
   enable: false
   save_checkpoint: false
-  path: outputs/PEMS08_H96/cluster_memory.pt
-  checkpoint_path: outputs/PEMS08_H96/best_checkpoint.pt
+  path: outputs/learnable_anchor_multi_h96/PEMS03_H96_evalonly/cluster_memory.pt
+  checkpoint_path: outputs/learnable_anchor_multi_h96/PEMS03_H96_evalonly/best_checkpoint.pt
 finetune:
   enable: true
-  checkpoint_path: F:\Python program\MoELoss - 20260401\outputs\pems08_h96_backbone_capacity\runs\hid192_b2\best_checkpoint.pt
+  checkpoint_path: F:\Python program\MoELoss - 20260401\outputs\pems_depth_rollout\runs\PEMS03_H96_hid192_b2\best_checkpoint.pt
   strict_window: true
   strict_model: true
   cluster_map: index
