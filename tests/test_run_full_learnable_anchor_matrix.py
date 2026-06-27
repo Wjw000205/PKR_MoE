@@ -160,6 +160,41 @@ def test_configure_run_preserves_pred_side_residual_when_not_explicitly_disabled
     assert cfg["moe"]["pred_side_residual"]["corrector_hidden"] == 32
 
 
+def test_configure_run_restores_train_budget_for_frozen_stage2_wrappers() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
+        "window": {"input_len": 96, "pred_len": 720},
+        "train": {
+            "epochs": 1,
+            "lr": 0.0,
+            "freeze_backbone": True,
+            "penalty_warmup_epochs": 15,
+        },
+        "early_stop": {"patience": 10, "min_delta": 1.0e-6},
+        "finetune": {"enable": True, "checkpoint_path": "old/best.pt"},
+        "moe": {"enable": True, "freeze_backbone": True},
+    }
+    job = Job(
+        dataset="ETTh1",
+        horizon=720,
+        base_config_path=Path("configs/ETTh1_H720.yaml"),
+        config_path=Path("generated/ETTh1_H720_stage2.yaml"),
+        out_dir=Path("outputs/full/ETTh1/H720"),
+        device="cuda:0",
+    )
+
+    cfg = configure_run(
+        base_cfg,
+        job=job,
+        skip_test=False,
+        disable_pred_side_residual=False,
+    )
+
+    assert cfg["train"]["epochs"] == 25
+    assert cfg["train"]["lr"] == 0.001
+    assert cfg["early_stop"]["patience"] == 10
+
+
 def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
     base_cfg = {
         "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},

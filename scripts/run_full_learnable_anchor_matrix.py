@@ -19,6 +19,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DEVICES = ("cuda:0", "cuda:2", "cuda:5")
 DEFAULT_WORKERS_PER_DEVICE = 2
+DEFAULT_STAGE2_LR = 0.001
 STANDARD_HORIZONS = (96, 192, 336, 720)
 PEMS_HORIZONS = (12, 24, 48, 96)
 STANDARD_DATASETS = ("ETTh1", "ETTh2", "ETTm1", "ETTm2", "weather", "electricity")
@@ -274,6 +275,20 @@ def apply_backbone_epoch_policy(
             cfg["train"]["lr"] = float(planned_lr)
 
 
+def apply_stage2_train_policy(cfg: dict[str, Any]) -> None:
+    cfg.setdefault("train", {})
+    cfg.setdefault("early_stop", {})
+    current_epochs = int(cfg["train"].get("epochs", 0) or 0)
+    penalty_warmup_epochs = int(cfg["train"].get("penalty_warmup_epochs", 0) or 0)
+    early_stop_patience = int(cfg["early_stop"].get("patience", 0) or 0)
+    min_epochs = penalty_warmup_epochs + early_stop_patience
+    if min_epochs > 0:
+        cfg["train"]["epochs"] = max(current_epochs, min_epochs)
+    current_lr = float(cfg["train"].get("lr", 0.0) or 0.0)
+    if current_lr <= 0.0:
+        cfg["train"]["lr"] = DEFAULT_STAGE2_LR
+
+
 def configure_common_paths(cfg: dict[str, Any], *, job: Job) -> None:
     cfg.setdefault("exp", {})
     cfg["exp"]["device"] = str(job.device)
@@ -361,6 +376,7 @@ def configure_run(
     }
     cfg.setdefault("train", {})
     cfg["train"]["freeze_backbone"] = True
+    apply_stage2_train_policy(cfg)
 
     cfg.setdefault("moe", {})
     cfg["moe"]["enable"] = True

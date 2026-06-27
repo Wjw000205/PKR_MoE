@@ -4527,6 +4527,19 @@ Hand back the report and STOP. Do not start a follow-up without me.
     isolation. Dry-run:
     `python scripts\run_full_learnable_anchor_matrix.py --stage full --out-root outputs\pipeline_runner_dryrun_20260627 --devices cuda:0 --workers-per-device 1 --datasets ETTh1 --horizons 96 --dry-run`
     confirms the new pipelined mode message and stage2 default `eval.skip_test:false`.
+    Stage2 train-budget fix (same date): server ETTh1-H720 stage2 completed after only one epoch
+    (`best_epoch=[1,1,1]`) because the root config is a frozen/eval wrapper with
+    `train.epochs:1` and `train.lr:0.0`. Config scan showed several ETT stage2 configs have
+    `epochs` below `penalty_warmup_epochs + early_stop.patience`. Fix: `configure_run()` now
+    restores a minimum stage2 budget of `penalty_warmup_epochs + early_stop.patience` and sets
+    `train.lr` to `0.001` only when the inherited lr is `<=0`; already-long configs keep their
+    schedule. Regression test:
+    `test_configure_run_restores_train_budget_for_frozen_stage2_wrappers`. Dry-run
+    `outputs\stage2_train_budget_dryrun_20260627` confirmed ETTh1-H720 stage2 now has
+    `train.epochs=25`, `train.lr=0.001`, `eval.skip_test:false`, and still loads the matching
+    fresh backbone checkpoint. If reusing `outputs/full_all_pipeline_stage2_test_20260627`, delete
+    completed non-`*_backbone` stage2 run dirs first; otherwise `--resume` will skip the old
+    one-epoch stage2 summaries.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
