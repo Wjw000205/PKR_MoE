@@ -299,6 +299,13 @@ def disable_pred_side_residual_config(cfg: dict[str, Any]) -> None:
     cfg["moe"]["pred_side_residual"]["selection_policy"] = "none"
 
 
+def disable_output_anchor_config(cfg: dict[str, Any]) -> None:
+    cfg.setdefault("moe", {})
+    cfg["moe"]["history_anchor_expert"] = {"enable": False}
+    cfg["moe"]["train_stat_anchor_expert"] = {"enable": False}
+    cfg["moe"]["train_residual_anchor_expert"] = {"enable": False}
+
+
 def configure_backbone_run(
     base_cfg: dict[str, Any],
     *,
@@ -318,6 +325,7 @@ def configure_backbone_run(
     cfg["moe"]["enable"] = False
     cfg["moe"]["freeze_backbone"] = False
     cfg["moe"]["learnable_output_anchor_refiner"] = {"enable": False}
+    disable_output_anchor_config(cfg)
     disable_pred_side_residual_config(cfg)
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = True

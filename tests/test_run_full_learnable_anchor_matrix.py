@@ -173,6 +173,21 @@ def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
         "moe": {
             "enable": True,
             "freeze_backbone": True,
+            "history_anchor_expert": {
+                "enable": True,
+                "lags": [96],
+                "alpha": 0.2,
+            },
+            "train_stat_anchor_expert": {
+                "enable": True,
+                "period": 96,
+                "alpha": 0.1,
+            },
+            "train_residual_anchor_expert": {
+                "enable": True,
+                "period": 96,
+                "alpha": 0.2,
+            },
             "pred_side_residual": {
                 "enable": True,
                 "selection_policy": "val_mse_candidate_channel_guarded",
@@ -205,6 +220,9 @@ def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
     assert cfg["train"]["freeze_backbone"] is False
     assert cfg["moe"]["enable"] is False
     assert cfg["moe"]["freeze_backbone"] is False
+    assert cfg["moe"]["history_anchor_expert"] == {"enable": False}
+    assert cfg["moe"]["train_stat_anchor_expert"] == {"enable": False}
+    assert cfg["moe"]["train_residual_anchor_expert"] == {"enable": False}
     assert cfg["moe"]["pred_side_residual"]["enable"] is False
     assert cfg["moe"]["pred_side_residual"]["selection_policy"] == "none"
     assert cfg["moe"]["learnable_output_anchor_refiner"]["enable"] is False

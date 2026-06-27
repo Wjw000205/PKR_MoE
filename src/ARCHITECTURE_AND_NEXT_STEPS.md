@@ -4488,6 +4488,25 @@ Hand back the report and STOP. Do not start a follow-up without me.
     Next server action: rerun affected backbone rows in a new out-root or delete their previous
     `H*_backbone` directories before using `--resume`; old completed summaries will otherwise be
     skipped.
+    Follow-up server diagnosis for `outputs/full_all_backbone_repro_lrfix_20260627`: user-pasted
+    ETTm2-H720, weather-H96, and ETTm1-H96 backbone logs still showed
+    `Train-stat anchor expert enabled` and `Train residual anchor expert enabled` even though
+    `moe.enable:false` and `Penalty summary: MoE disabled`. Root cause: main-table output-anchor
+    defaults are injected at runtime by `src.train` when the anchor keys are absent, independent
+    of penalty-MoE enablement. Therefore this out-root's "backbone" `val_mse/val_mae` values are
+    backbone + static/residual output anchors, not pure backbone, and should not be used for
+    backbone reproduction comparison. Fix: `configure_backbone_run()` now explicitly writes
+    `history_anchor_expert`, `train_stat_anchor_expert`, and `train_residual_anchor_expert` as
+    `{enable:false}` in generated `H*_backbone.yaml` files while leaving stage-2 configs
+    unchanged. Regression test:
+    `test_configure_backbone_run_trains_and_saves_backbone_checkpoint` now covers this by starting
+    from enabled output-anchor settings and requiring the backbone config to override them off.
+    Dry-run check:
+    `python scripts\run_full_learnable_anchor_matrix.py --stage backbone --out-root outputs\codex_noanchor_config_check_20260627 --devices cuda:0 --workers-per-device 1 --datasets ETTm2 --horizons 720 --dry-run`
+    confirmed the generated `ETTm2/H720_backbone.yaml` has all three output-anchor keys plus
+    `learnable_output_anchor_refiner` disabled. Next server action: do not resume any
+    `full_all_backbone_repro_lrfix_20260627` rows for pure-backbone comparison; rerun in a fresh
+    no-anchor out-root, starting with ETT/ETTm only before revisiting Weather recipe recovery.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
