@@ -4507,6 +4507,14 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `learnable_output_anchor_refiner` disabled. Next server action: do not resume any
     `full_all_backbone_repro_lrfix_20260627` rows for pure-backbone comparison; rerun in a fresh
     no-anchor out-root, starting with ETT/ETTm only before revisiting Weather recipe recovery.
+    Server confirmation: rerunning no-anchor ETTh1-H96 from
+    `outputs/full_all_backbone_repro_noanchor_20260627/configs/ETTh1/H96_backbone.yaml` produced
+    no `Train-stat anchor expert enabled` / `Train residual anchor expert enabled` logs and ended
+    at `val=0.693868/0.541674`, matching the historical raw no-anchor ETTh1-H96 backbone
+    reference `0.693864/0.541669` (not the anchor-augmented `0.640669/0.534645` row). Conclusion:
+    `0.640669` is the historical backbone+default-output-anchor path, while the true raw backbone
+    reproduction target is `0.693864/0.541669`. Keep these baselines separate when judging stage2
+    or learnable-anchor effects.
     Pipeline scheduler update (same date): per user request, `--stage full` no longer waits for
     every backbone job to complete before starting any stage2 job. Each worker now runs a local
     pipeline for each assigned pair: `H*_backbone.yaml` first, then immediately the matching
