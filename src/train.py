@@ -7,7 +7,7 @@ import time
 import math
 import sys
 import builtins
-from typing import Dict, Iterable, List, Tuple, Optional
+from typing import Callable, Dict, Iterable, List, Tuple, Optional
 import numpy as np
 import torch
 from torch import nn
@@ -526,6 +526,15 @@ def _normalize_gate_feature_mode(mode: str) -> str:
     if value in {"history_base", "history+base", "input_base", "safe_augmented"}:
         return "history_base"
     raise ValueError("moe.gate_feature_mode must be 'history' or 'history_base'.")
+
+
+def _normalize_pred_residual_selection_policy(value: object) -> str:
+    policy = str(value if value is not None else "none").lower()
+    if policy in {"false", "off", "disable", "disabled"}:
+        return "none"
+    if policy == "val_mse_candidate_channel_guarded":
+        return "val_mse_candidate_channel"
+    return policy
 
 
 def _gate_feature_names_for_mode(mode: str = "history") -> List[str]:
@@ -3556,6 +3565,163 @@ def _learnable_output_anchor_static_batch(
 
 
 @torch.no_grad()
+def _learnable_output_anchor_eval_path_static_batch(
+    *,
+    model: nn.Module,
+    gate: nn.Module,
+    x_bcl: torch.Tensor,
+    query_start_abs_b: torch.Tensor,
+    cluster_id_c: torch.Tensor,
+    K: int,
+    moe_cfg: dict,
+    device: torch.device,
+    input_len: int,
+    penalty_names: List[str],
+    penalty_fns: Dict[str, callable],
+    select_ranks: Optional[List[int]] = None,
+    gate_soft_weight: float = 0.0,
+    gate_feature_mode: str = "history",
+    penalty_scale: Optional[torch.Tensor] = None,
+    pred_residual: Optional[ClusterwisePredResidualMoE] = None,
+    pred_residual_selector: Optional[nn.Module] = None,
+    pred_residual_scale_c: Optional[torch.Tensor] = None,
+    history_anchor_cfg: Optional[dict] = None,
+    observed_history_tc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_pc: Optional[torch.Tensor] = None,
+    model_train_stat_adapter_cfg: Optional[dict] = None,
+    train_stat_anchor_pc: Optional[torch.Tensor] = None,
+    train_residual_anchor_phc: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model.eval()
+    gate.eval()
+    if pred_residual is not None:
+        pred_residual.eval()
+    if pred_residual_selector is not None:
+        pred_residual_selector.eval()
+
+    moe_enable = bool((moe_cfg or {}).get("enable", True))
+    allow_skip = bool((moe_cfg or {}).get("allow_skip", False)) and moe_enable
+    router_mode = str((moe_cfg or {}).get("router_mode", "learned")).lower()
+    router_penalty_context_weight = float((moe_cfg or {}).get("router_penalty_context_weight", 0.0))
+    router_detach_penalty_context = bool((moe_cfg or {}).get("router_penalty_context_detach", True))
+    router_penalty_context_score = str((moe_cfg or {}).get("router_penalty_context_score", "high_violation")).lower()
+    gate_feature_mode = _normalize_gate_feature_mode(gate_feature_mode)
+    penalty_names = list(penalty_names or [])
+    P = len(penalty_names)
+
+    x_model = apply_train_stat_input_centering(
+        x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        stat_anchor_pc=model_train_stat_adapter_pc,
+        cfg=model_train_stat_adapter_cfg,
+    )
+    y_base_raw = model(x_model, cluster_id_c)
+    y_base = apply_history_anchor_adapter(
+        y_base_raw,
+        base_pred_bch=y_base_raw,
+        observed_history_tc=observed_history_tc,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len or x_bcl.shape[-1]),
+        cfg=history_anchor_cfg,
+    )
+    y_base = apply_train_stat_anchor_expert(
+        y_base,
+        base_pred_bch=y_base,
+        x_bcl=x_bcl,
+        query_start_abs_b=query_start_abs_b,
+        input_len=int(input_len or x_bcl.shape[-1]),
+        stat_anchor_pc=model_train_stat_adapter_pc,
+        cfg=model_train_stat_adapter_cfg,
+    )
+    route_pen_bkp = _router_penalty_context_from_history(
+        x_bcl=x_bcl,
+        yhat_base_bch=y_base,
+        penalty_names=penalty_names,
+        penalty_fns=penalty_fns,
+        penalty_scale=penalty_scale,
+        cluster_id_c=cluster_id_c,
+        K=K,
+    )
+    if moe_enable and P > 0:
+        gate_feat_bkf = _build_gate_routing_features(x_bcl, y_base, cluster_id_c, K, mode=gate_feature_mode)
+        straight_through = not bool((moe_cfg or {}).get("detach_penalty_grad", True))
+        mask_bkp, probs_bkp, skip_bk, _ = gate(
+            gate_feat_bkf,
+            straight_through=straight_through,
+            penalty_context_bkp=route_pen_bkp,
+            penalty_context_mode=router_mode,
+            penalty_context_weight=router_penalty_context_weight,
+            penalty_context_detach=router_detach_penalty_context,
+            penalty_context_score=router_penalty_context_score,
+        )
+        rank_mask = None
+        if select_ranks is not None:
+            mask_bkp = _select_rank_mask(probs_bkp, select_ranks, straight_through=straight_through)
+            rank_mask = _select_rank_mask(probs_bkp, select_ranks, straight_through=False)
+        if gate_soft_weight > 0.0:
+            probs_sel = probs_bkp
+            if rank_mask is not None:
+                probs_sel = probs_sel * rank_mask
+                probs_sel = probs_sel / probs_sel.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            target_mass = mask_bkp.detach().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            probs_sel = probs_sel * target_mass
+            mask_bkp = (1.0 - gate_soft_weight) * mask_bkp + gate_soft_weight * probs_sel
+    else:
+        mask_bkp = torch.zeros_like(route_pen_bkp)
+        skip_bk = None
+
+    output_anchors_applied = False
+    if pred_residual is not None and moe_enable and P > 0:
+        pred_out = pred_residual(
+            x_bcl,
+            y_base,
+            cluster_id_c,
+            mask_bkp,
+            skip_bk=skip_bk if allow_skip else None,
+            query_start_abs_b=query_start_abs_b,
+        )
+        y_static = pred_out["y_final"]
+        if pred_residual_selector is not None:
+            selector_base_bch, cand_bcpH = _pred_residual_candidates_on_eval_path(
+                y_base,
+                pred_out,
+                pred_residual_scale_c=pred_residual_scale_c,
+                apply_output_anchors=True,
+                x_bcl=x_bcl,
+                query_start_abs_b=query_start_abs_b,
+                input_len=int(input_len or x_bcl.shape[-1]),
+                moe_cfg=moe_cfg,
+                moe_enable=moe_enable,
+                observed_history_tc=observed_history_tc,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+            if cand_bcpH is not None:
+                y_static, _ = pred_residual_selector.select_prediction(x_bcl, selector_base_bch, cand_bcpH)
+                output_anchors_applied = True
+        elif pred_residual_scale_c is not None:
+            scale = pred_residual_scale_c.to(device=y_static.device, dtype=y_static.dtype).view(1, -1, 1)
+            y_static = y_base + scale * (y_static - y_base)
+    else:
+        y_static = y_base
+
+    if not output_anchors_applied:
+        y_static = apply_moe_output_anchor_experts(
+            y_static,
+            base_pred_bch=y_base,
+            x_bcl=x_bcl,
+            query_start_abs_b=query_start_abs_b,
+            input_len=int(input_len or x_bcl.shape[-1]),
+            moe_cfg=moe_cfg,
+            moe_enable=moe_enable,
+            observed_history_tc=observed_history_tc,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+        )
+    return y_base.detach(), y_static.detach()
+
+
+@torch.no_grad()
 def _evaluate_learnable_output_anchor_refiner(
     *,
     model: nn.Module,
@@ -3572,6 +3738,7 @@ def _evaluate_learnable_output_anchor_refiner(
     model_train_stat_adapter_cfg: Optional[dict] = None,
     train_stat_anchor_pc: Optional[torch.Tensor] = None,
     train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    static_batch_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> Dict[str, float]:
     model.eval()
     if refiner is not None:
@@ -3585,20 +3752,23 @@ def _evaluate_learnable_output_anchor_refiner(
         y = y.to(device, non_blocking=True)
         idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
         query_start_abs_b = int(eval_start) + idx
-        y_base, y_static = _learnable_output_anchor_static_batch(
-            model=model,
-            x_bcl=x,
-            query_start_abs_b=query_start_abs_b,
-            cluster_id_c=cluster_id_c,
-            moe_cfg=moe_cfg,
-            history_anchor_cfg=history_anchor_cfg,
-            observed_history_tc=observed_history_tc,
-            input_len=input_len,
-            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
-            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
-            train_stat_anchor_pc=train_stat_anchor_pc,
-            train_residual_anchor_phc=train_residual_anchor_phc,
-        )
+        if static_batch_fn is None:
+            y_base, y_static = _learnable_output_anchor_static_batch(
+                model=model,
+                x_bcl=x,
+                query_start_abs_b=query_start_abs_b,
+                cluster_id_c=cluster_id_c,
+                moe_cfg=moe_cfg,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=observed_history_tc,
+                input_len=input_len,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+        else:
+            y_base, y_static = static_batch_fn(x_bcl=x, query_start_abs_b=query_start_abs_b)
         y_refined = y_static
         if refiner is not None:
             y_refined = refiner(
@@ -3696,6 +3866,7 @@ def train_learnable_output_anchor_refiner(
     model_train_stat_adapter_cfg: Optional[dict] = None,
     train_stat_anchor_pc: Optional[torch.Tensor] = None,
     train_residual_anchor_phc: Optional[torch.Tensor] = None,
+    static_batch_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> Tuple[Optional[ClusterwiseLearnableOutputAnchorRefiner], Dict[str, object]]:
     cfg = cfg or {}
     summary: Dict[str, object] = {"enable": bool(cfg.get("enable", False))}
@@ -3747,6 +3918,7 @@ def train_learnable_output_anchor_refiner(
         model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
         train_stat_anchor_pc=train_stat_anchor_pc,
         train_residual_anchor_phc=train_residual_anchor_phc,
+        static_batch_fn=static_batch_fn,
     )
     best_metric = float(initial_metrics[f"static_{selection_metric}"])
     best_state = {name: value.detach().cpu().clone() for name, value in refiner.state_dict().items()}
@@ -3761,20 +3933,23 @@ def train_learnable_output_anchor_refiner(
             y = y.to(device, non_blocking=True)
             idx = idx.to(device=device, dtype=torch.long, non_blocking=True)
             query_start_abs_b = int(train_eval_start) + idx
-            y_base, y_static = _learnable_output_anchor_static_batch(
-                model=model,
-                x_bcl=x,
-                query_start_abs_b=query_start_abs_b,
-                cluster_id_c=cluster_id_c,
-                moe_cfg=moe_cfg,
-                history_anchor_cfg=history_anchor_cfg,
-                observed_history_tc=observed_history_tc,
-                input_len=input_len,
-                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
-                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
-                train_stat_anchor_pc=train_stat_anchor_pc,
-                train_residual_anchor_phc=train_residual_anchor_phc,
-            )
+            if static_batch_fn is None:
+                y_base, y_static = _learnable_output_anchor_static_batch(
+                    model=model,
+                    x_bcl=x,
+                    query_start_abs_b=query_start_abs_b,
+                    cluster_id_c=cluster_id_c,
+                    moe_cfg=moe_cfg,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=observed_history_tc,
+                    input_len=input_len,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                )
+            else:
+                y_base, y_static = static_batch_fn(x_bcl=x, query_start_abs_b=query_start_abs_b)
             pred = refiner(
                 x_bcl=x,
                 base_pred_bch=y_base,
@@ -3804,6 +3979,7 @@ def train_learnable_output_anchor_refiner(
             model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
             train_stat_anchor_pc=train_stat_anchor_pc,
             train_residual_anchor_phc=train_residual_anchor_phc,
+            static_batch_fn=static_batch_fn,
         )
         metric_value = float(metrics[f"refined_{selection_metric}"])
         if metric_value < best_metric:
@@ -3849,6 +4025,7 @@ def train_learnable_output_anchor_refiner(
             model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
             train_stat_anchor_pc=train_stat_anchor_pc,
             train_residual_anchor_phc=train_residual_anchor_phc,
+            static_batch_fn=static_batch_fn,
         )
     refined_metric = float(best_metrics[f"refined_{selection_metric}"])
     metric_gain = static_metric - refined_metric
@@ -13544,6 +13721,7 @@ def main():
     learnable_output_anchor_summary: Dict[str, object] = {
         "enable": bool(learnable_output_anchor_cfg.get("enable", False)),
     }
+    learnable_static_batch_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None
     moe_gate_penalty_hit_summary = None
     penalty_explainability_summary = None
     penalty_route_learnability_summary = None
@@ -13585,9 +13763,9 @@ def main():
             "per_channel_mse": [float(v) for v in val_mse_c_base.detach().cpu().tolist()],
             "per_channel_mae": [float(v) for v in val_mae_c_base.detach().cpu().tolist()],
         }
-        residual_selection_policy = str(pred_residual_cfg.get("selection_policy", "none")).lower()
-        if residual_selection_policy in {"false", "off", "disable", "disabled"}:
-            residual_selection_policy = "none"
+        residual_selection_policy = _normalize_pred_residual_selection_policy(
+            pred_residual_cfg.get("selection_policy", "none")
+        )
         if residual_selection_policy not in {
             "none",
             "val_mse_channel",
@@ -14338,90 +14516,113 @@ def main():
                     f"adopted={bool(selector_adoption['adopt'])}, "
                     f"holdout_gain={((pred_residual_selector_summary or {}).get('holdout') or {}).get('selected_gain_pct_vs_base')}"
                 )
+        learnable_static_batch_fn = None
+        if pred_residual is not None:
+            def learnable_final_static_batch(*, x_bcl: torch.Tensor, query_start_abs_b: torch.Tensor):
+                return _learnable_output_anchor_eval_path_static_batch(
+                    model=model,
+                    gate=gate,
+                    x_bcl=x_bcl,
+                    query_start_abs_b=query_start_abs_b,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    input_len=L,
+                    penalty_names=penalty_names,
+                    penalty_fns=penalty_fns,
+                    select_ranks=select_ranks,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_feature_mode=gate_feature_mode,
+                    penalty_scale=penalty_scale,
+                    pred_residual=pred_residual,
+                    pred_residual_selector=pred_residual_selector_model,
+                    pred_residual_scale_c=pred_residual_channel_scale_c,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                )
+
+            learnable_static_batch_fn = learnable_final_static_batch
         if bool(learnable_output_anchor_cfg.get("enable", False)):
-            if pred_residual is not None:
-                learnable_output_anchor_summary.update(
-                    {
-                        "adopted": False,
-                        "reason": "unsupported_with_pred_side_residual",
-                    }
+            refiner_train_loader = DataLoader(
+                dtr,
+                batch_size=int(cfg["train"]["batch_size"]),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_mem,
+            )
+            learnable_output_anchor_refiner_model, learnable_output_anchor_summary = (
+                train_learnable_output_anchor_refiner(
+                    model=model,
+                    train_loader=refiner_train_loader,
+                    val_loader=val_loader_summary,
+                    cluster_id_c=cluster_id_c,
+                    K=K,
+                    moe_cfg=moe_cfg,
+                    device=device,
+                    input_len=L,
+                    channel_count=C,
+                    cfg=learnable_output_anchor_cfg,
+                    train_eval_start=0,
+                    val_eval_start=val_eval_start,
+                    history_anchor_cfg=history_anchor_cfg,
+                    observed_history_tc=data_window_tc,
+                    model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                    model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                    train_stat_anchor_pc=train_stat_anchor_pc,
+                    train_residual_anchor_phc=train_residual_anchor_phc,
+                    static_batch_fn=learnable_static_batch_fn,
                 )
-                print("Learnable output-anchor refiner skipped: pred_side_residual path is enabled.")
-            else:
-                refiner_train_loader = DataLoader(
-                    dtr,
-                    batch_size=int(cfg["train"]["batch_size"]),
-                    shuffle=False,
-                    num_workers=0,
-                    pin_memory=pin_mem,
+            )
+            if learnable_output_anchor_refiner_model is not None:
+                (
+                    val_refiner_loss_k,
+                    val_refiner_mse_k,
+                    val_refiner_mae_k,
+                    val_refiner_mse_c,
+                    val_refiner_mae_c,
+                    _,
+                    _,
+                    _,
+                ) = eval_loop_with_history(
+                    model, gate, lam_kp_best,
+                    penalty_names, penalty_fns,
+                    val_loader_summary, cluster_id_c, K, moe_cfg, device,
+                    select_ranks=select_ranks,
+                    collect_plot=False, channel_count=C,
+                    mse_weight=mse_weight,
+                    gate_entropy_weight=gate_entropy_weight,
+                    gate_balance_weight=gate_balance_weight,
+                    gate_soft_weight=gate_soft_weight,
+                    gate_entropy_target_frac=gate_entropy_target_frac,
+                    penalty_scale=penalty_scale,
+                    dynamic_lambda=dynamic_lambda,
+                    lambda_min_kp=lambda_min_kp,
+                    mae_objective_weight=mae_eval_weight,
+                    mae_objective_kind=mae_objective_kind,
+                    mae_objective_beta=mae_objective_beta,
+                    pred_residual=pred_residual,
+                    pred_residual_selector=pred_residual_selector_model,
+                    pred_residual_scale_c=pred_residual_channel_scale_c,
+                    learnable_output_anchor_refiner=learnable_output_anchor_refiner_model,
+                    eval_start=val_eval_start,
                 )
-                learnable_output_anchor_refiner_model, learnable_output_anchor_summary = (
-                    train_learnable_output_anchor_refiner(
-                        model=model,
-                        train_loader=refiner_train_loader,
-                        val_loader=val_loader_summary,
-                        cluster_id_c=cluster_id_c,
-                        K=K,
-                        moe_cfg=moe_cfg,
-                        device=device,
-                        input_len=L,
-                        channel_count=C,
-                        cfg=learnable_output_anchor_cfg,
-                        train_eval_start=0,
-                        val_eval_start=val_eval_start,
-                        history_anchor_cfg=history_anchor_cfg,
-                        observed_history_tc=data_window_tc,
-                        model_train_stat_adapter_pc=model_train_stat_adapter_pc,
-                        model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
-                        train_stat_anchor_pc=train_stat_anchor_pc,
-                        train_residual_anchor_phc=train_residual_anchor_phc,
-                    )
-                )
-                if learnable_output_anchor_refiner_model is not None:
-                    (
-                        val_refiner_loss_k,
-                        val_refiner_mse_k,
-                        val_refiner_mae_k,
-                        val_refiner_mse_c,
-                        val_refiner_mae_c,
-                        _,
-                        _,
-                        _,
-                    ) = eval_loop_with_history(
-                        model, gate, lam_kp_best,
-                        penalty_names, penalty_fns,
-                        val_loader_summary, cluster_id_c, K, moe_cfg, device,
-                        select_ranks=select_ranks,
-                        collect_plot=False, channel_count=C,
-                        mse_weight=mse_weight,
-                        gate_entropy_weight=gate_entropy_weight,
-                        gate_balance_weight=gate_balance_weight,
-                        gate_soft_weight=gate_soft_weight,
-                        gate_entropy_target_frac=gate_entropy_target_frac,
-                        penalty_scale=penalty_scale,
-                        dynamic_lambda=dynamic_lambda,
-                        lambda_min_kp=lambda_min_kp,
-                        mae_objective_weight=mae_eval_weight,
-                        mae_objective_kind=mae_objective_kind,
-                        mae_objective_beta=mae_objective_beta,
-                        pred_residual=pred_residual,
-                        pred_residual_selector=pred_residual_selector_model,
-                        pred_residual_scale_c=pred_residual_channel_scale_c,
-                        learnable_output_anchor_refiner=learnable_output_anchor_refiner_model,
-                        eval_start=val_eval_start,
-                    )
-                    val_mse_c_base = val_refiner_mse_c
-                    val_mae_c_base = val_refiner_mae_c
-                    val_summary = {
-                        "avg_loss": float(reduce_cluster_metric(val_refiner_loss_k, cluster_weight_k).item()),
-                        "avg_mse": float(reduce_cluster_metric(val_refiner_mse_k, cluster_weight_k).item()),
-                        "avg_mae": float(reduce_cluster_metric(val_refiner_mae_k, cluster_weight_k).item()),
-                        "per_cluster_loss": [float(v) for v in val_refiner_loss_k.detach().cpu().tolist()],
-                        "per_cluster_mse": [float(v) for v in val_refiner_mse_k.detach().cpu().tolist()],
-                        "per_cluster_mae": [float(v) for v in val_refiner_mae_k.detach().cpu().tolist()],
-                        "per_channel_mse": [float(v) for v in val_refiner_mse_c.detach().cpu().tolist()],
-                        "per_channel_mae": [float(v) for v in val_refiner_mae_c.detach().cpu().tolist()],
-                    }
+                val_mse_c_base = val_refiner_mse_c
+                val_mae_c_base = val_refiner_mae_c
+                val_summary = {
+                    "avg_loss": float(reduce_cluster_metric(val_refiner_loss_k, cluster_weight_k).item()),
+                    "avg_mse": float(reduce_cluster_metric(val_refiner_mse_k, cluster_weight_k).item()),
+                    "avg_mae": float(reduce_cluster_metric(val_refiner_mae_k, cluster_weight_k).item()),
+                    "per_cluster_loss": [float(v) for v in val_refiner_loss_k.detach().cpu().tolist()],
+                    "per_cluster_mse": [float(v) for v in val_refiner_mse_k.detach().cpu().tolist()],
+                    "per_cluster_mae": [float(v) for v in val_refiner_mae_k.detach().cpu().tolist()],
+                    "per_channel_mse": [float(v) for v in val_refiner_mse_c.detach().cpu().tolist()],
+                    "per_channel_mae": [float(v) for v in val_refiner_mae_c.detach().cpu().tolist()],
+                }
                 print(
                     "Learnable output-anchor refiner: "
                     f"adopted={bool(learnable_output_anchor_summary.get('adopted', False))}, "
@@ -14602,6 +14803,7 @@ def main():
                 model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
                 train_stat_anchor_pc=train_stat_anchor_pc,
                 train_residual_anchor_phc=train_residual_anchor_phc,
+                static_batch_fn=learnable_static_batch_fn,
             )
             update_learnable_output_anchor_summary_with_split_metrics(
                 learnable_output_anchor_summary,

@@ -4345,13 +4345,13 @@ Hand back the report and STOP. Do not start a follow-up without me.
     PEMS03/04/07/08 at horizons `12/24/48/96` (40 jobs total). Default server parallelism matches
     the available GPUs reported by the user: `cuda:0,cuda:2,cuda:5` with `2` workers per GPU. The
     runner keeps each base config's training schedule intact, forces `moe.enable: true`, enables
-    the channel-gated `moe.learnable_output_anchor_refiner`, and disables
-    `moe.pred_side_residual` by default because the current trainer otherwise skips the learnable
-    refiner when pred-side residual is active. Dry-run validation command:
+    the channel-gated `moe.learnable_output_anchor_refiner`, and now preserves the base config's
+    PKR-MoE/pred-side residual path by default. `--disable-pred-side-residual` remains available
+    only as an explicit ablation; do not use it for main-table comparison. Dry-run validation command:
     `python scripts\run_full_learnable_anchor_matrix.py --dry-run --out-root outputs\full_learnable_anchor_matrix_dryrun`
     generated 40 configs and `summary.csv`; structured YAML check confirmed all 40 configs have
-    the requested horizon, `moe.enable: true`, learnable refiner enabled, and pred-side residual
-    disabled. Full launch command for the server/workstation:
+    the requested horizon, `moe.enable: true`, and learnable refiner enabled. Full launch command
+    for the server/workstation:
     `python scripts\run_full_learnable_anchor_matrix.py --out-root outputs\full_learnable_anchor_matrix_20260627 --devices cuda:0,cuda:2,cuda:5 --workers-per-device 2 --resume`.
     Add `--skip-test` for val-only discipline; omit it only for an intentional full train+test
     pass.
@@ -4395,10 +4395,26 @@ Hand back the report and STOP. Do not start a follow-up without me.
     (`0.938/0.647 -> 0.732/0.642`) while still being far worse than the main table
     (`0.463/0.461`). Diagnosis: base-pipeline mismatch / pred-side residual removal and fresh
     backbone retraining dominate; do not judge learnable-anchor adoption from this full-runner
-    table. Next smallest action: run checkpoint-preserving, main-table-config probes that add the
-    learnable refiner without disabling existing tuned components, or first implement refiner
-    support after the pred-side residual path so ETT comparisons are true A/B. Until that is done,
-    avoid a server full test matrix for ETT as it will answer the wrong question.
+    table. Historical diagnosis: that run answered the wrong question and should not be used to
+    judge learnable-anchor adoption.
+    Inheritance fix after user clarification (same date): the runner now trains the fresh backbone
+    first, freezes it, and stage-2 inherits the original PKR-MoE/pred-side residual config instead
+    of disabling it. `moe.pred_side_residual.selection_policy: val_mse_candidate_channel_guarded`
+    is normalized to the existing candidate-channel runtime path, and the learnable output-anchor
+    refiner now trains/evaluates on the full static final prediction after PKR-MoE, pred-side
+    residual selection/scaling, and static output anchors. Dry-run
+    `outputs\inheritance_runner_dryrun_20260627` confirmed ETTh1-H96 `H96_backbone.yaml` has
+    `moe.enable:false`, `finetune.enable:false`, and `H96_stage2.yaml` has `moe.enable:true`,
+    `pred_side_residual.enable:true`, guarded selection preserved in YAML, learnable anchor
+    enabled, and `finetune.checkpoint_path` pointing at the fresh backbone checkpoint. Smoke command:
+    `python scripts\run_full_learnable_anchor_matrix.py --out-root outputs\inheritance_runner_etth1_h96_smoke_20260627 --devices cuda:0 --workers-per-device 1 --datasets ETTh1 --horizons 96 --skip-test --python C:\Users\33932\.conda\envs\my_fram\python.exe`
+    completed one val-only job in 33s. Stage2 log confirmed pred-side residual selection ran
+    (`val_base_MSE=0.661999`, `val_residual_MSE=0.660699`, `val_scaled_MSE=0.660708`) and then the
+    learnable refiner adopted on the inherited static path (`val_static_MSE=0.660708`,
+    `val_refined_MSE=0.655046`, `val_static_MAE=0.545516`, `val_refined_MAE=0.539212`,
+    `adopted_channel_count=2`). Next action: rerun ETT or full server matrix with the inherited
+    runner; use `--skip-test` for val-only screening first, then read test once for the selected
+    full run.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits

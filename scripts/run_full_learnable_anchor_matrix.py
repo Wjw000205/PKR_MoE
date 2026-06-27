@@ -572,7 +572,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Only generate configs and summary plan.")
     parser.add_argument("--resume", action="store_true", help="Skip jobs with completed run_summary.json.")
     parser.add_argument("--skip-test", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--disable-pred-side-residual", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--disable-pred-side-residual", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 

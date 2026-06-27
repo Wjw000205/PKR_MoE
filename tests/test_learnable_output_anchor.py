@@ -5,6 +5,7 @@ import torch
 
 import src.train as train_module
 from src.models.learnable_anchor import ClusterwiseLearnableOutputAnchorRefiner
+from src.train import _normalize_pred_residual_selection_policy
 from src.train import eval_loop, train_learnable_output_anchor_refiner
 from src.train import update_learnable_output_anchor_summary_with_split_metrics
 
@@ -35,6 +36,13 @@ class _AddOneRefiner(torch.nn.Module):
         cluster_id_c: torch.Tensor,
     ) -> torch.Tensor:
         return static_pred_bch + 1.0
+
+
+def test_guarded_pred_residual_selection_policy_uses_candidate_channel_runtime_path() -> None:
+    assert (
+        _normalize_pred_residual_selection_policy("val_mse_candidate_channel_guarded")
+        == "val_mse_candidate_channel"
+    )
 
 
 def test_zero_init_preserves_static_anchor_output() -> None:

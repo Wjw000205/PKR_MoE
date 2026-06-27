@@ -122,6 +122,42 @@ def test_configure_run_enables_pkr_moe_and_learnable_anchor_without_changing_tra
     assert cfg["moe"]["learnable_output_anchor_refiner"] == learnable_anchor_config()
 
 
+def test_configure_run_preserves_pred_side_residual_when_not_explicitly_disabled() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:7"},
+        "window": {"input_len": 96, "pred_len": 96},
+        "train": {"epochs": 36, "freeze_backbone": False},
+        "moe": {
+            "enable": True,
+            "freeze_backbone": False,
+            "pred_side_residual": {
+                "enable": True,
+                "selection_policy": "val_mse_candidate_channel_guarded",
+                "corrector_hidden": 32,
+            },
+        },
+    }
+    job = Job(
+        dataset="ETTh1",
+        horizon=96,
+        base_config_path=Path("configs/ETTh1_H96.yaml"),
+        config_path=Path("generated/ETTh1_H96.yaml"),
+        out_dir=Path("outputs/full/ETTh1/H96"),
+        device="cuda:0",
+    )
+
+    cfg = configure_run(
+        base_cfg,
+        job=job,
+        skip_test=True,
+        disable_pred_side_residual=False,
+    )
+
+    assert cfg["moe"]["pred_side_residual"]["enable"] is True
+    assert cfg["moe"]["pred_side_residual"]["selection_policy"] == "val_mse_candidate_channel_guarded"
+    assert cfg["moe"]["pred_side_residual"]["corrector_hidden"] == 32
+
+
 def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
     base_cfg = {
         "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
