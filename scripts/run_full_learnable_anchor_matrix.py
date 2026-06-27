@@ -655,6 +655,137 @@ def _run_assigned_single_stage(
     return rows
 
 
+def _sort_rows(rows: list[dict[str, Any]]) -> None:
+    rows.sort(key=lambda row: (str(row["dataset"]), int(row["horizon"])))
+
+
+def _run_assigned_full_pipeline(
+    assigned: dict[str, list[Job]],
+    *,
+    python_exe: str,
+    resume: bool,
+    summary_path: Path,
+    log_dir: Path,
+    progress: Callable[[str], None] | None = print_progress,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    backbone_rows: list[dict[str, Any]] = []
+    rows_lock = threading.Lock()
+    total_jobs = sum(len(jobs) for jobs in assigned.values())
+    completed_jobs = 0
+    started_at = time.time()
+    backbone_summary_path = backbone_summary_path_for(summary_path)
+
+    def append_and_write(path: Path, target_rows: list[dict[str, Any]], row: dict[str, Any]) -> None:
+        target_rows.append(row)
+        _sort_rows(target_rows)
+        write_rows(path, target_rows)
+
+    def emit(
+        *,
+        completed: int,
+        job: Job,
+        worker_key: str,
+        status: str,
+        error: str = "",
+    ) -> None:
+        if progress is None:
+            return
+        progress(
+            format_progress_line(
+                completed=completed,
+                total=total_jobs,
+                job=job,
+                worker_key=worker_key,
+                status=status,
+                elapsed_s=time.time() - started_at,
+                error=error,
+            )
+        )
+
+    def run_worker(worker_key: str, worker_jobs: list[Job]) -> list[dict[str, Any]]:
+        nonlocal completed_jobs
+        worker_rows: list[dict[str, Any]] = []
+        for job in worker_jobs:
+            backbone_job = as_backbone_job(job)
+            if resume and completed_summary(job.out_dir / "run_summary.json"):
+                row = row_from_summary(job, status="skipped")
+                row["worker"] = worker_key
+                worker_rows.append(row)
+                with rows_lock:
+                    if completed_summary(backbone_job.out_dir / "run_summary.json"):
+                        backbone_row = row_from_summary(backbone_job, status="skipped")
+                        backbone_row["worker"] = worker_key
+                        append_and_write(backbone_summary_path, backbone_rows, backbone_row)
+                    completed_jobs += 1
+                    append_and_write(summary_path, rows, row)
+                    emit(completed=completed_jobs, job=job, worker_key=worker_key, status="stage2_skipped")
+                continue
+
+            with rows_lock:
+                emit(completed=completed_jobs, job=backbone_job, worker_key=worker_key, status="backbone_start")
+            backbone_row = run_job(backbone_job, python_exe=python_exe, resume=resume, log_dir=log_dir)
+            backbone_row["worker"] = worker_key
+            with rows_lock:
+                append_and_write(backbone_summary_path, backbone_rows, backbone_row)
+                emit(
+                    completed=completed_jobs,
+                    job=backbone_job,
+                    worker_key=worker_key,
+                    status=f"backbone_{backbone_row.get('status', 'done')}",
+                    error=str(backbone_row.get("error", "")),
+                )
+
+            if backbone_row.get("status") not in {"ok", "skipped"}:
+                error = f"backbone stage failed: {backbone_row.get('error', '')}"
+                row = row_from_summary(
+                    job,
+                    status="failed",
+                    returncode=int(backbone_row.get("returncode") or 1),
+                    error=error,
+                )
+                row["worker"] = worker_key
+                worker_rows.append(row)
+                with rows_lock:
+                    completed_jobs += 1
+                    append_and_write(summary_path, rows, row)
+                    emit(
+                        completed=completed_jobs,
+                        job=job,
+                        worker_key=worker_key,
+                        status="stage2_skipped",
+                        error=error,
+                    )
+                continue
+
+            with rows_lock:
+                emit(completed=completed_jobs, job=job, worker_key=worker_key, status="stage2_start")
+            row = run_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
+            row["worker"] = worker_key
+            worker_rows.append(row)
+            with rows_lock:
+                completed_jobs += 1
+                append_and_write(summary_path, rows, row)
+                emit(
+                    completed=completed_jobs,
+                    job=job,
+                    worker_key=worker_key,
+                    status=f"stage2_{row.get('status', 'done')}",
+                    error=str(row.get("error", "")),
+                )
+        return worker_rows
+
+    with ThreadPoolExecutor(max_workers=len(assigned)) as executor:
+        futures = [executor.submit(run_worker, key, jobs) for key, jobs in assigned.items() if jobs]
+        for future in as_completed(futures):
+            future.result()
+    _sort_rows(backbone_rows)
+    _sort_rows(rows)
+    write_rows(backbone_summary_path, backbone_rows)
+    write_rows(summary_path, rows)
+    return rows
+
+
 def _map_assigned_jobs(assigned: dict[str, list[Job]], mapper: Callable[[Job], Job]) -> dict[str, list[Job]]:
     return {worker_key: [mapper(job) for job in worker_jobs] for worker_key, worker_jobs in assigned.items()}
 
@@ -684,31 +815,13 @@ def run_assigned(
         raise ValueError("stage must be 'backbone' or 'full'.")
 
     if progress is not None:
-        progress("BACKBONE_PHASE start: all backbone jobs must complete before stage2 starts")
-    backbone_rows = _run_assigned_single_stage(
-        _map_assigned_jobs(assigned, as_backbone_job),
-        python_exe=python_exe,
-        resume=resume,
-        summary_path=backbone_summary_path_for(summary_path),
-        log_dir=log_dir,
-        phase="backbone",
-        progress=progress,
-    )
-    failed_backbone = [row for row in backbone_rows if row.get("status") == "failed"]
-    if failed_backbone:
-        if progress is not None:
-            progress(f"BACKBONE_PHASE failed: {len(failed_backbone)} jobs failed; stage2 skipped")
-        return backbone_rows
-
-    if progress is not None:
-        progress("STAGE2_PHASE start: frozen-backbone PKR-MoE + learnable anchor")
-    return _run_assigned_single_stage(
+        progress("PIPELINE_PHASE start: each backbone job is followed immediately by its frozen stage2 + test job")
+    return _run_assigned_full_pipeline(
         assigned,
         python_exe=python_exe,
         resume=resume,
         summary_path=summary_path,
         log_dir=log_dir,
-        phase="stage2",
         progress=progress,
     )
 
@@ -782,7 +895,11 @@ def main() -> None:
     if stage == "backbone":
         print("Training mode: backbone-only reproduction")
     else:
-        print("Training mode: two-stage (backbone checkpoint first, then frozen-backbone PKR-MoE + anchor)")
+        print("Training mode: pipelined two-stage (each backbone is followed by frozen PKR-MoE + anchor)")
+        if args.skip_test:
+            print("Stage2 evaluation: validation only (--skip-test)")
+        else:
+            print("Stage2 evaluation: validation + test")
     print(f"Backbone epoch policy: {args.backbone_epoch_policy}")
     if args.dry_run:
         return

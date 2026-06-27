@@ -481,7 +481,7 @@ def test_run_environment_does_not_remap_physical_cuda_device() -> None:
     assert env["PYTHONUTF8"] == "1"
 
 
-def test_full_stage_runs_all_backbones_before_any_stage2(monkeypatch, tmp_path: Path) -> None:
+def test_full_stage_pipelines_stage2_after_each_successful_backbone(monkeypatch, tmp_path: Path) -> None:
     jobs = [
         Job(
             dataset="ETTm1",
@@ -527,8 +527,8 @@ def test_full_stage_runs_all_backbones_before_any_stage2(monkeypatch, tmp_path: 
 
     assert calls == [
         as_backbone_job(jobs[0]).out_dir.as_posix(),
-        as_backbone_job(jobs[1]).out_dir.as_posix(),
         jobs[0].out_dir.as_posix(),
+        as_backbone_job(jobs[1]).out_dir.as_posix(),
         jobs[1].out_dir.as_posix(),
     ]
     assert len(rows) == 2
@@ -536,7 +536,7 @@ def test_full_stage_runs_all_backbones_before_any_stage2(monkeypatch, tmp_path: 
     assert backbone_summary_path_for(tmp_path / "summary.csv").exists()
 
 
-def test_full_stage_skips_stage2_when_any_backbone_fails(monkeypatch, tmp_path: Path) -> None:
+def test_full_stage_skips_only_the_failed_backbone_job_stage2(monkeypatch, tmp_path: Path) -> None:
     jobs = [
         Job(
             dataset="ETTm1",
@@ -545,14 +545,29 @@ def test_full_stage_skips_stage2_when_any_backbone_fails(monkeypatch, tmp_path: 
             config_path=tmp_path / "configs" / "ETTm1" / "H96_stage2.yaml",
             out_dir=tmp_path / "runs" / "ETTm1" / "H96",
             device="cuda:0",
-        )
+        ),
+        Job(
+            dataset="ETTm2",
+            horizon=192,
+            base_config_path=Path("base.yaml"),
+            config_path=tmp_path / "configs" / "ETTm2" / "H192_stage2.yaml",
+            out_dir=tmp_path / "runs" / "ETTm2" / "H192",
+            device="cuda:0",
+        ),
     ]
     calls: list[str] = []
 
     def fake_run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict:
         _ = python_exe, resume, log_dir
         calls.append(job.out_dir.as_posix())
-        return runner.row_from_summary(job, status="failed", returncode=1, error="boom")
+        if job.out_dir == as_backbone_job(jobs[0]).out_dir:
+            return runner.row_from_summary(job, status="failed", returncode=1, error="boom")
+        job.out_dir.mkdir(parents=True, exist_ok=True)
+        (job.out_dir / "run_summary.json").write_text(
+            json.dumps({"val": {"avg_mse": 1.0, "avg_mae": 2.0}}),
+            encoding="utf-8",
+        )
+        return runner.row_from_summary(job, status="ok")
 
     monkeypatch.setattr(runner, "run_job", fake_run_job)
 
@@ -566,9 +581,15 @@ def test_full_stage_skips_stage2_when_any_backbone_fails(monkeypatch, tmp_path: 
         progress=None,
     )
 
-    assert calls == [as_backbone_job(jobs[0]).out_dir.as_posix()]
-    assert rows[0]["status"] == "failed"
-    assert rows[0]["error"] == "boom"
+    assert calls == [
+        as_backbone_job(jobs[0]).out_dir.as_posix(),
+        as_backbone_job(jobs[1]).out_dir.as_posix(),
+        jobs[1].out_dir.as_posix(),
+    ]
+    rows_by_dataset = {row["dataset"]: row for row in rows}
+    assert rows_by_dataset["ETTm1"]["status"] == "failed"
+    assert rows_by_dataset["ETTm1"]["error"] == "backbone stage failed: boom"
+    assert rows_by_dataset["ETTm2"]["status"] == "ok"
 
 
 def test_format_duration_is_stable_for_progress_output() -> None:

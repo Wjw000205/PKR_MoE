@@ -4507,6 +4507,18 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `learnable_output_anchor_refiner` disabled. Next server action: do not resume any
     `full_all_backbone_repro_lrfix_20260627` rows for pure-backbone comparison; rerun in a fresh
     no-anchor out-root, starting with ETT/ETTm only before revisiting Weather recipe recovery.
+    Pipeline scheduler update (same date): per user request, `--stage full` no longer waits for
+    every backbone job to complete before starting any stage2 job. Each worker now runs a local
+    pipeline for each assigned pair: `H*_backbone.yaml` first, then immediately the matching
+    `H*_stage2.yaml` with frozen PKR-MoE + learnable anchor and default validation+test evaluation.
+    `backbone_summary.csv` is written incrementally as backbone rows finish, and `summary.csv` is
+    written incrementally as each stage2/test row finishes. If one backbone fails, only that
+    dataset/horizon's stage2 row is marked failed (`backbone stage failed: ...`); other workers and
+    later jobs continue. `--stage backbone` remains backbone-only. Regression tests now cover the
+    per-job call order (`backbone0 -> stage2_0 -> backbone1 -> stage2_1`) and per-job failure
+    isolation. Dry-run:
+    `python scripts\run_full_learnable_anchor_matrix.py --stage full --out-root outputs\pipeline_runner_dryrun_20260627 --devices cuda:0 --workers-per-device 1 --datasets ETTh1 --horizons 96 --dry-run`
+    confirms the new pipelined mode message and stage2 default `eval.skip_test:false`.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
