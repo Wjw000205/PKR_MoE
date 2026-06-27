@@ -4415,6 +4415,46 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `adopted_channel_count=2`). Next action: rerun ETT or full server matrix with the inherited
     runner; use `--skip-test` for val-only screening first, then read test once for the selected
     full run.
+    Backbone-first reprioritization after user clarification (same date): before attaching
+    learnable anchors or PKR-MoE, reproduce backbone checkpoints. Diagnosis: many checked-in
+    ETT/Weather configs are stage-2 configs with `train.epochs:1`; using them directly for fresh
+    backbone training undertrains the backbone and breaks comparability. ETTh1-H96 proved this:
+    the old runner's 1-epoch fresh backbone was `val=0.661999/0.546046`, while retraining the same
+    backbone path to the historical checkpoint's selected epochs reproduced the old base exactly:
+    `outputs\backbone_repro_etth1_h96_e30_20260627\run\run_summary.json` has
+    `val=0.640669584/0.534643769`, `best_epoch=[20,20,21]`, matching the historical checkpoint's
+    base path in `outputs\moe_headroom_probe_20260620`.
+    Runner change: `scripts/run_full_learnable_anchor_matrix.py` now supports
+    `--stage backbone` to generate/run only `H*_backbone.yaml` configs, with no stage2 configs.
+    Full mode is also globally phased: it writes/runs all backbone jobs first into
+    `backbone_summary.csv`, and stage2 (`summary.csv`) starts only after every backbone job is
+    `ok` or `skipped`; if any backbone fails, stage2 is skipped. It also has
+    `--backbone-epoch-policy main-table` (default) using epoch floors extracted from local
+    historical checkpoint metadata for ETT/Weather cases where the root config is stage2.
+    Dry-run:
+    `python scripts\run_full_learnable_anchor_matrix.py --stage backbone --dry-run --out-root outputs\backbone_repro_ettm_dryrun_20260627 --devices cuda:0 --workers-per-device 1 --datasets ETTm1,ETTm2 --horizons 96,192,336,720 --resume`
+    generated 8 backbone-only configs and 0 stage2 configs; epochs were
+    `ETTm1 H96/H192/H336/H720 = 26/23/49/40` and
+    `ETTm2 H96/H192/H336/H720 = 31/35/30/40`.
+    Local backbone reproduction checks:
+    `outputs\backbone_repro_ettm1_h192_20260627` reproduced ETTm1-H192 exactly
+    (`val=0.459767401/0.453592390`, `best_epoch=[22,21,23]`, same as the historical checkpoint's
+    base metric in `outputs\input96_transfer_qgwnt_full_horizon\source\ETTm1\H192`), and
+    `outputs\backbone_repro_ettm2_h192_20260627` reproduced ETTm2-H192 exactly
+    (`val=0.155889586/0.269677699`, `best_epoch=[35,28]`, same as the historical checkpoint's
+    base metric in `outputs\input96_transfer_qgwnt_full_horizon\source\ETTm2\H192`). Validation:
+    `python -m pytest tests\test_run_full_learnable_anchor_matrix.py -q` -> 16 passed;
+    `python -m py_compile scripts\run_full_learnable_anchor_matrix.py` passed.
+    Follow-up validation after global two-phase enforcement:
+    `python scripts\run_full_learnable_anchor_matrix.py --stage full --dry-run --out-root outputs\full_global_two_phase_dryrun_20260627 --devices cuda:0 --workers-per-device 1 --datasets ETTm1,ETTm2 --horizons 192 --resume`
+    produced `backbone_summary.csv` with only backbone config/out dirs and `summary.csv` with only
+    stage2 config/out dirs; generated configs showed ETTm1-H192 backbone epochs `23` and ETTm2-H192
+    backbone epochs `35`, while their stage2 configs kept the original one-epoch frozen-head
+    schedule. `python -m pytest tests\test_run_full_learnable_anchor_matrix.py -q` -> 18 passed.
+    Next action: run the full backbone-only reproduction matrix first, starting with ETTm/ETT:
+    `python scripts\run_full_learnable_anchor_matrix.py --stage backbone --out-root outputs\backbone_repro_main_table_20260627 --devices cuda:0,cuda:2,cuda:5 --workers-per-device 2 --datasets ETTh1,ETTh2,ETTm1,ETTm2 --horizons 96,192,336,720 --resume`.
+    Only after backbone rows match the historical base metrics should `--stage full` be used to
+    attach frozen-backbone PKR-MoE and learnable anchors.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits

@@ -24,6 +24,26 @@ PEMS_HORIZONS = (12, 24, 48, 96)
 STANDARD_DATASETS = ("ETTh1", "ETTh2", "ETTm1", "ETTm2", "weather", "electricity")
 PEMS_DATASETS = ("PEMS03", "PEMS04", "PEMS07", "PEMS08")
 ALL_DATASETS = STANDARD_DATASETS + PEMS_DATASETS
+# Minimum backbone epochs needed to reach the historical main-table checkpoint
+# selection points when the checked-in config is a stage-2 config.
+MAIN_TABLE_BACKBONE_EPOCHS: dict[tuple[str, int], int] = {
+    ("ETTh1", 96): 21,
+    ("ETTh1", 336): 37,
+    ("ETTh1", 720): 29,
+    ("ETTh2", 96): 34,
+    ("ETTh2", 720): 22,
+    ("ETTm1", 96): 26,
+    ("ETTm1", 192): 23,
+    ("ETTm1", 336): 49,
+    ("ETTm2", 96): 31,
+    ("ETTm2", 192): 35,
+    ("ETTm2", 336): 30,
+    ("ETTm2", 720): 40,
+    ("weather", 96): 18,
+    ("weather", 192): 55,
+    ("weather", 336): 16,
+    ("weather", 720): 21,
+}
 
 SUMMARY_FIELDS = [
     "status",
@@ -203,6 +223,36 @@ def backbone_checkpoint_path(job: Job) -> Path:
     return backbone_out_dir(job) / "best_checkpoint.pt"
 
 
+def as_backbone_job(job: Job) -> Job:
+    return replace(
+        job,
+        config_path=backbone_config_path(job),
+        out_dir=backbone_out_dir(job),
+    )
+
+
+def main_table_backbone_epochs(dataset: str, horizon: int) -> int | None:
+    return MAIN_TABLE_BACKBONE_EPOCHS.get((str(dataset), int(horizon)))
+
+
+def apply_backbone_epoch_policy(
+    cfg: dict[str, Any],
+    *,
+    job: Job,
+    policy: str = "main-table",
+) -> None:
+    if str(policy).lower().replace("_", "-") == "config":
+        return
+    if str(policy).lower().replace("_", "-") != "main-table":
+        raise ValueError("backbone epoch policy must be 'main-table' or 'config'.")
+    planned_epochs = main_table_backbone_epochs(job.dataset, job.horizon)
+    if planned_epochs is None:
+        return
+    cfg.setdefault("train", {})
+    current_epochs = int(cfg["train"].get("epochs", 0) or 0)
+    cfg["train"]["epochs"] = max(current_epochs, int(planned_epochs))
+
+
 def configure_common_paths(cfg: dict[str, Any], *, job: Job) -> None:
     cfg.setdefault("exp", {})
     cfg["exp"]["device"] = str(job.device)
@@ -228,18 +278,20 @@ def disable_pred_side_residual_config(cfg: dict[str, Any]) -> None:
     cfg["moe"]["pred_side_residual"]["selection_policy"] = "none"
 
 
-def configure_backbone_run(base_cfg: dict[str, Any], *, job: Job) -> dict[str, Any]:
-    backbone_job = replace(
-        job,
-        config_path=backbone_config_path(job),
-        out_dir=backbone_out_dir(job),
-    )
+def configure_backbone_run(
+    base_cfg: dict[str, Any],
+    *,
+    job: Job,
+    backbone_epoch_policy: str = "main-table",
+) -> dict[str, Any]:
+    backbone_job = as_backbone_job(job)
     cfg = copy.deepcopy(base_cfg)
     configure_common_paths(cfg, job=backbone_job)
     cfg["exp"]["name"] = f"{job.dataset}_H{job.horizon}_backbone_full"
     cfg["exp"]["out_dir"] = backbone_job.out_dir.as_posix()
     cfg["finetune"] = {"enable": False}
     cfg.setdefault("train", {})
+    apply_backbone_epoch_policy(cfg, job=job, policy=backbone_epoch_policy)
     cfg["train"]["freeze_backbone"] = False
     cfg.setdefault("moe", {})
     cfg["moe"]["enable"] = False
@@ -406,14 +458,22 @@ def prepare_configs(
     *,
     skip_test: bool,
     disable_pred_side_residual: bool,
+    backbone_epoch_policy: str = "main-table",
+    include_stage2: bool = True,
 ) -> None:
     missing = [job.base_config_path for job in jobs if not job.base_config_path.exists()]
     if missing:
         formatted = "\n".join(str(path) for path in missing)
         raise FileNotFoundError(f"Missing base configs:\n{formatted}")
     for job in jobs:
-        backbone_cfg = configure_backbone_run(read_yaml(job.base_config_path), job=job)
+        backbone_cfg = configure_backbone_run(
+            read_yaml(job.base_config_path),
+            job=job,
+            backbone_epoch_policy=backbone_epoch_policy,
+        )
         write_yaml(backbone_config_path(job), backbone_cfg)
+        if not include_stage2:
+            continue
         stage2_cfg = configure_run(
             read_yaml(job.base_config_path),
             job=job,
@@ -469,11 +529,7 @@ def run_two_stage_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path)
     if resume and completed_summary(job.out_dir / "run_summary.json"):
         return row_from_summary(job, status="skipped")
 
-    backbone_job = replace(
-        job,
-        config_path=backbone_config_path(job),
-        out_dir=backbone_out_dir(job),
-    )
+    backbone_job = as_backbone_job(job)
     backbone_row = run_job(backbone_job, python_exe=python_exe, resume=resume, log_dir=log_dir)
     if backbone_row.get("status") not in {"ok", "skipped"}:
         return row_from_summary(
@@ -484,6 +540,14 @@ def run_two_stage_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path)
         )
 
     return run_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
+
+
+def run_backbone_only_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict[str, Any]:
+    return run_job(as_backbone_job(job), python_exe=python_exe, resume=resume, log_dir=log_dir)
+
+
+def backbone_summary_path_for(summary_path: Path) -> Path:
+    return summary_path.with_name("backbone_summary.csv")
 
 
 def os_environ_utf8() -> dict[str, str]:
@@ -500,13 +564,14 @@ def run_environment_for_job(job: Job) -> dict[str, str]:
     return os_environ_utf8()
 
 
-def run_assigned(
+def _run_assigned_single_stage(
     assigned: dict[str, list[Job]],
     *,
     python_exe: str,
     resume: bool,
     summary_path: Path,
     log_dir: Path,
+    phase: str,
     progress: Callable[[str], None] | None = print_progress,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -527,11 +592,11 @@ def run_assigned(
                             total=total_jobs,
                             job=job,
                             worker_key=worker_key,
-                            status="start",
+                            status=f"{phase}_start",
                             elapsed_s=time.time() - started_at,
                         )
                     )
-            row = run_two_stage_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
+            row = run_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
             row["worker"] = worker_key
             worker_rows.append(row)
             with rows_lock:
@@ -545,7 +610,7 @@ def run_assigned(
                             total=total_jobs,
                             job=job,
                             worker_key=worker_key,
-                            status=str(row.get("status", "done")),
+                            status=f"{phase}_{row.get('status', 'done')}",
                             elapsed_s=time.time() - started_at,
                             error=str(row.get("error", "")),
                         )
@@ -561,6 +626,64 @@ def run_assigned(
     return rows
 
 
+def _map_assigned_jobs(assigned: dict[str, list[Job]], mapper: Callable[[Job], Job]) -> dict[str, list[Job]]:
+    return {worker_key: [mapper(job) for job in worker_jobs] for worker_key, worker_jobs in assigned.items()}
+
+
+def run_assigned(
+    assigned: dict[str, list[Job]],
+    *,
+    python_exe: str,
+    resume: bool,
+    summary_path: Path,
+    log_dir: Path,
+    stage: str = "full",
+    progress: Callable[[str], None] | None = print_progress,
+) -> list[dict[str, Any]]:
+    stage = str(stage).lower()
+    if stage == "backbone":
+        return _run_assigned_single_stage(
+            _map_assigned_jobs(assigned, as_backbone_job),
+            python_exe=python_exe,
+            resume=resume,
+            summary_path=summary_path,
+            log_dir=log_dir,
+            phase="backbone",
+            progress=progress,
+        )
+    if stage != "full":
+        raise ValueError("stage must be 'backbone' or 'full'.")
+
+    if progress is not None:
+        progress("BACKBONE_PHASE start: all backbone jobs must complete before stage2 starts")
+    backbone_rows = _run_assigned_single_stage(
+        _map_assigned_jobs(assigned, as_backbone_job),
+        python_exe=python_exe,
+        resume=resume,
+        summary_path=backbone_summary_path_for(summary_path),
+        log_dir=log_dir,
+        phase="backbone",
+        progress=progress,
+    )
+    failed_backbone = [row for row in backbone_rows if row.get("status") == "failed"]
+    if failed_backbone:
+        if progress is not None:
+            progress(f"BACKBONE_PHASE failed: {len(failed_backbone)} jobs failed; stage2 skipped")
+        return backbone_rows
+
+    if progress is not None:
+        progress("STAGE2_PHASE start: frozen-backbone PKR-MoE + learnable anchor")
+    return _run_assigned_single_stage(
+        assigned,
+        python_exe=python_exe,
+        resume=resume,
+        summary_path=summary_path,
+        log_dir=log_dir,
+        phase="stage2",
+        progress=progress,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-root", default="outputs/full_learnable_anchor_matrix_20260627")
@@ -571,8 +694,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizons", default="all", help="Comma-separated horizon list, or all.")
     parser.add_argument("--dry-run", action="store_true", help="Only generate configs and summary plan.")
     parser.add_argument("--resume", action="store_true", help="Skip jobs with completed run_summary.json.")
+    parser.add_argument(
+        "--stage",
+        choices=("backbone", "full"),
+        default="full",
+        help="Run backbone-only reproduction or full two-stage PKR-MoE + learnable-anchor jobs.",
+    )
     parser.add_argument("--skip-test", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--disable-pred-side-residual", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--backbone-epoch-policy",
+        choices=("main-table", "config"),
+        default="main-table",
+        help="Use main-table backbone epoch floors for stage-2 configs, or keep config train.epochs.",
+    )
     return parser.parse_args()
 
 
@@ -583,25 +718,43 @@ def main() -> None:
     datasets = parse_dataset_filter(str(args.datasets))
     horizons = parse_horizon_filter(str(args.horizons))
     jobs = build_matrix(out_root=out_root, devices=devices, datasets=datasets, horizons=horizons)
+    stage = str(args.stage).lower()
     prepare_configs(
         jobs,
         skip_test=bool(args.skip_test),
         disable_pred_side_residual=bool(args.disable_pred_side_residual),
+        backbone_epoch_policy=str(args.backbone_epoch_policy),
+        include_stage2=stage != "backbone",
     )
     assigned = assign_jobs_to_devices(jobs, devices, int(args.workers_per_device))
     summary_path = out_root / "summary.csv"
+    backbone_summary_path = backbone_summary_path_for(summary_path)
     log_dir = out_root / "logs"
     plan_rows: list[dict[str, Any]] = []
+    backbone_plan_rows: list[dict[str, Any]] = []
     for worker_key, worker_jobs in assigned.items():
         for job in worker_jobs:
-            row = row_from_summary(job, status="planned")
+            summary_job = as_backbone_job(job) if stage == "backbone" else job
+            row = row_from_summary(summary_job, status="planned")
             row["worker"] = worker_key
             plan_rows.append(row)
+            backbone_row = row_from_summary(as_backbone_job(job), status="planned")
+            backbone_row["worker"] = worker_key
+            backbone_plan_rows.append(backbone_row)
     write_rows(summary_path, plan_rows)
-    print(f"Generated {len(jobs)} backbone configs and {len(jobs)} stage2 configs under {out_root / 'configs'}")
+    if stage == "full":
+        write_rows(backbone_summary_path, backbone_plan_rows)
+    stage2_count = 0 if stage == "backbone" else len(jobs)
+    print(f"Generated {len(jobs)} backbone configs and {stage2_count} stage2 configs under {out_root / 'configs'}")
     print(f"Summary: {summary_path}")
+    if stage == "full":
+        print(f"Backbone summary: {backbone_summary_path}")
     print(f"Devices: {', '.join(devices)}; workers/device={args.workers_per_device}")
-    print("Training mode: two-stage (backbone checkpoint first, then frozen-backbone PKR-MoE + anchor)")
+    if stage == "backbone":
+        print("Training mode: backbone-only reproduction")
+    else:
+        print("Training mode: two-stage (backbone checkpoint first, then frozen-backbone PKR-MoE + anchor)")
+    print(f"Backbone epoch policy: {args.backbone_epoch_policy}")
     if args.dry_run:
         return
     rows = run_assigned(
@@ -610,6 +763,7 @@ def main() -> None:
         resume=bool(args.resume),
         summary_path=summary_path,
         log_dir=log_dir,
+        stage=stage,
     )
     failed = [row for row in rows if row.get("status") == "failed"]
     if failed:

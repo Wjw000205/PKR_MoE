@@ -11,7 +11,9 @@ from scripts.run_full_learnable_anchor_matrix import (
     DEFAULT_WORKERS_PER_DEVICE,
     Job,
     assign_jobs_to_devices,
+    as_backbone_job,
     build_matrix,
+    backbone_summary_path_for,
     backbone_config_path,
     backbone_out_dir,
     configure_backbone_run,
@@ -210,6 +212,31 @@ def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
     assert cfg["memory"]["checkpoint_path"] == "outputs/full/PEMS08/H96_backbone/best_checkpoint.pt"
 
 
+def test_configure_backbone_run_uses_main_table_epoch_floor_for_stage2_configs() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
+        "window": {"input_len": 96, "pred_len": 96},
+        "finetune": {"enable": True, "checkpoint_path": "old/best.pt"},
+        "train": {"epochs": 1, "freeze_backbone": True},
+        "moe": {"enable": True, "freeze_backbone": True},
+        "memory": {"save_checkpoint": False},
+    }
+    job = Job(
+        dataset="ETTh1",
+        horizon=96,
+        base_config_path=Path("configs/ETTh1_H96.yaml"),
+        config_path=Path("generated/ETTh1_H96.yaml"),
+        out_dir=Path("outputs/full/ETTh1/H96"),
+        device="cuda:0",
+    )
+
+    cfg = configure_backbone_run(base_cfg, job=job)
+    config_policy_cfg = configure_backbone_run(base_cfg, job=job, backbone_epoch_policy="config")
+
+    assert cfg["train"]["epochs"] == 21
+    assert config_policy_cfg["train"]["epochs"] == 1
+
+
 def test_two_stage_paths_are_derived_from_stage2_job() -> None:
     job = Job(
         dataset="weather",
@@ -222,6 +249,8 @@ def test_two_stage_paths_are_derived_from_stage2_job() -> None:
 
     assert backbone_config_path(job) == Path("outputs/full/configs/weather/H720_backbone.yaml")
     assert backbone_out_dir(job) == Path("outputs/full/runs/weather/H720_backbone")
+    assert as_backbone_job(job).config_path == backbone_config_path(job)
+    assert as_backbone_job(job).out_dir == backbone_out_dir(job)
 
 
 def test_prepare_configs_writes_backbone_and_stage2_configs(tmp_path: Path) -> None:
@@ -258,6 +287,44 @@ def test_prepare_configs_writes_backbone_and_stage2_configs(tmp_path: Path) -> N
     assert stage2_cfg["moe"]["enable"] is True
     assert stage2_cfg["moe"]["freeze_backbone"] is True
     assert stage2_cfg["finetune"]["checkpoint_path"].endswith("H96_backbone/best_checkpoint.pt")
+
+
+def test_prepare_configs_can_write_backbone_only_repro_configs(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        yaml.safe_dump(
+            {
+                "exp": {"device": "cuda:7", "out_dir": "old"},
+                "window": {"input_len": 96, "pred_len": 96},
+                "train": {"epochs": 1, "freeze_backbone": True},
+                "finetune": {"enable": True, "checkpoint_path": "old/best.pt"},
+                "moe": {"enable": True, "freeze_backbone": True},
+                "memory": {"save_checkpoint": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = Job(
+        dataset="ETTh1",
+        horizon=96,
+        base_config_path=base_path,
+        config_path=tmp_path / "configs" / "ETTh1" / "H96_stage2.yaml",
+        out_dir=tmp_path / "runs" / "ETTh1" / "H96",
+        device="cuda:0",
+    )
+
+    prepare_configs(
+        [job],
+        skip_test=True,
+        disable_pred_side_residual=False,
+        include_stage2=False,
+    )
+
+    backbone_cfg = yaml.safe_load(backbone_config_path(job).read_text(encoding="utf-8"))
+    assert backbone_cfg["train"]["epochs"] == 21
+    assert backbone_cfg["moe"]["enable"] is False
+    assert backbone_cfg["finetune"] == {"enable": False}
+    assert not job.config_path.exists()
 
 
 def test_row_from_summary_exports_learnable_test_generalization_metrics(tmp_path: Path) -> None:
@@ -343,6 +410,96 @@ def test_run_environment_does_not_remap_physical_cuda_device() -> None:
     assert env["PYTHONUTF8"] == "1"
 
 
+def test_full_stage_runs_all_backbones_before_any_stage2(monkeypatch, tmp_path: Path) -> None:
+    jobs = [
+        Job(
+            dataset="ETTm1",
+            horizon=96,
+            base_config_path=Path("base.yaml"),
+            config_path=tmp_path / "configs" / "ETTm1" / "H96_stage2.yaml",
+            out_dir=tmp_path / "runs" / "ETTm1" / "H96",
+            device="cuda:0",
+        ),
+        Job(
+            dataset="ETTm2",
+            horizon=192,
+            base_config_path=Path("base.yaml"),
+            config_path=tmp_path / "configs" / "ETTm2" / "H192_stage2.yaml",
+            out_dir=tmp_path / "runs" / "ETTm2" / "H192",
+            device="cuda:0",
+        ),
+    ]
+    assigned = {"cuda:0#1": jobs}
+    calls: list[str] = []
+
+    def fake_run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict:
+        _ = python_exe, resume, log_dir
+        calls.append(job.out_dir.as_posix())
+        job.out_dir.mkdir(parents=True, exist_ok=True)
+        (job.out_dir / "run_summary.json").write_text(
+            json.dumps({"val": {"avg_mse": 1.0, "avg_mae": 2.0}}),
+            encoding="utf-8",
+        )
+        return runner.row_from_summary(job, status="ok")
+
+    monkeypatch.setattr(runner, "run_job", fake_run_job)
+
+    rows = runner.run_assigned(
+        assigned,
+        python_exe="python",
+        resume=True,
+        summary_path=tmp_path / "summary.csv",
+        log_dir=tmp_path / "logs",
+        stage="full",
+        progress=None,
+    )
+
+    assert calls == [
+        as_backbone_job(jobs[0]).out_dir.as_posix(),
+        as_backbone_job(jobs[1]).out_dir.as_posix(),
+        jobs[0].out_dir.as_posix(),
+        jobs[1].out_dir.as_posix(),
+    ]
+    assert len(rows) == 2
+    assert {row["status"] for row in rows} == {"ok"}
+    assert backbone_summary_path_for(tmp_path / "summary.csv").exists()
+
+
+def test_full_stage_skips_stage2_when_any_backbone_fails(monkeypatch, tmp_path: Path) -> None:
+    jobs = [
+        Job(
+            dataset="ETTm1",
+            horizon=96,
+            base_config_path=Path("base.yaml"),
+            config_path=tmp_path / "configs" / "ETTm1" / "H96_stage2.yaml",
+            out_dir=tmp_path / "runs" / "ETTm1" / "H96",
+            device="cuda:0",
+        )
+    ]
+    calls: list[str] = []
+
+    def fake_run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path) -> dict:
+        _ = python_exe, resume, log_dir
+        calls.append(job.out_dir.as_posix())
+        return runner.row_from_summary(job, status="failed", returncode=1, error="boom")
+
+    monkeypatch.setattr(runner, "run_job", fake_run_job)
+
+    rows = runner.run_assigned(
+        {"cuda:0#1": jobs},
+        python_exe="python",
+        resume=True,
+        summary_path=tmp_path / "summary.csv",
+        log_dir=tmp_path / "logs",
+        stage="full",
+        progress=None,
+    )
+
+    assert calls == [as_backbone_job(jobs[0]).out_dir.as_posix()]
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["error"] == "boom"
+
+
 def test_format_duration_is_stable_for_progress_output() -> None:
     assert format_duration(0) == "00:00:00"
     assert format_duration(65.9) == "00:01:05"
@@ -407,8 +564,9 @@ def test_run_assigned_emits_start_and_finish_progress(tmp_path: Path, monkeypatc
         resume=False,
         summary_path=tmp_path / "summary.csv",
         log_dir=tmp_path / "logs",
+        stage="backbone",
         progress=progress_lines.append,
     )
 
-    assert progress_lines[0].startswith("[0/1 0.0%] START weather_H96")
-    assert progress_lines[1].startswith("[1/1 100.0%] OK weather_H96")
+    assert progress_lines[0].startswith("[0/1 0.0%] BACKBONE_START weather_H96")
+    assert progress_lines[1].startswith("[1/1 100.0%] BACKBONE_OK weather_H96")
