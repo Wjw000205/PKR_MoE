@@ -44,6 +44,15 @@ MAIN_TABLE_BACKBONE_EPOCHS: dict[tuple[str, int], int] = {
     ("weather", 336): 16,
     ("weather", 720): 21,
 }
+# Some checked-in configs are stage-2/frozen evaluation configs, so their train
+# lr is deliberately 0.0. Backbone repro configs must recover the stage-1 lr.
+MAIN_TABLE_BACKBONE_LR: dict[tuple[str, int], float] = {
+    ("ETTh1", 720): 0.001,
+    ("weather", 96): 0.001,
+    ("weather", 192): 0.001,
+    ("weather", 336): 0.001,
+    ("weather", 720): 0.001,
+}
 
 SUMMARY_FIELDS = [
     "status",
@@ -235,6 +244,10 @@ def main_table_backbone_epochs(dataset: str, horizon: int) -> int | None:
     return MAIN_TABLE_BACKBONE_EPOCHS.get((str(dataset), int(horizon)))
 
 
+def main_table_backbone_lr(dataset: str, horizon: int) -> float | None:
+    return MAIN_TABLE_BACKBONE_LR.get((str(dataset), int(horizon)))
+
+
 def apply_backbone_epoch_policy(
     cfg: dict[str, Any],
     *,
@@ -254,6 +267,11 @@ def apply_backbone_epoch_policy(
     cfg.setdefault("early_stop", {})
     current_patience = int(cfg["early_stop"].get("patience", 0) or 0)
     cfg["early_stop"]["patience"] = max(current_patience, int(planned_epochs))
+    planned_lr = main_table_backbone_lr(job.dataset, job.horizon)
+    if planned_lr is not None:
+        current_lr = float(cfg["train"].get("lr", 0.0) or 0.0)
+        if current_lr <= 0.0:
+            cfg["train"]["lr"] = float(planned_lr)
 
 
 def configure_common_paths(cfg: dict[str, Any], *, job: Job) -> None:

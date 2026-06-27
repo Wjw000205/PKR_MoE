@@ -4472,6 +4472,22 @@ Hand back the report and STOP. Do not start a follow-up without me.
     Do not reuse `outputs/full_all_backbone_then_stage2_20260627` with `--resume` for these rows,
     because the bad completed backbone summaries would be skipped. Use a new out-root or delete
     the affected backbone and downstream stage2 run directories before resuming.
+    Follow-up server diagnosis for `outputs/full_all_backbone_repro_fixed_20260627`: ETTh1-H720
+    still selected `[16,16,16]` even after the patience fix. User pasted the generated
+    `H720_backbone.yaml`, which showed `train.epochs:29`, `early_stop.patience:29`, but
+    `train.lr:0.0`. Git history for `configs/ETTh1_H720.yaml` confirmed this lr was changed from
+    the stage-1 value `0.001` to `0.0` when the checked-in file became a frozen stage-2/checkpoint
+    config. Root cause: the runner restored epoch length but still inherited the stage-2 no-update
+    learning rate, so backbone parameters could not move. Fix: under
+    `--backbone-epoch-policy main-table`, `scripts/run_full_learnable_anchor_matrix.py` now
+    restores a positive stage-1 lr for known frozen stage-2 configs with `lr<=0`
+    (`ETTh1-H720`, `weather-H96/H192/H336/H720`). Regression test:
+    `test_configure_backbone_run_restores_main_table_lr_for_frozen_stage2_configs` failed before
+    the fix (`lr` stayed `0.0`) and passes after. Config-generation check confirmed
+    `ETTh1-H720 epochs/patience/lr=29/29/0.001` and weather restored to positive lr as well.
+    Next server action: rerun affected backbone rows in a new out-root or delete their previous
+    `H*_backbone` directories before using `--resume`; old completed summaries will otherwise be
+    skipped.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits

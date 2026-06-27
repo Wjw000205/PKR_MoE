@@ -264,6 +264,32 @@ def test_configure_backbone_run_extends_early_stop_patience_to_reach_main_table_
     assert config_policy_cfg["early_stop"]["patience"] == 1
 
 
+def test_configure_backbone_run_restores_main_table_lr_for_frozen_stage2_configs() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
+        "window": {"input_len": 96, "pred_len": 720},
+        "finetune": {"enable": True, "checkpoint_path": "old/best.pt"},
+        "train": {"epochs": 1, "lr": 0.0, "freeze_backbone": True},
+        "early_stop": {"patience": 10, "min_delta": 1.0e-6},
+        "moe": {"enable": True, "freeze_backbone": True},
+        "memory": {"save_checkpoint": False},
+    }
+    job = Job(
+        dataset="ETTh1",
+        horizon=720,
+        base_config_path=Path("configs/ETTh1_H720.yaml"),
+        config_path=Path("generated/ETTh1_H720.yaml"),
+        out_dir=Path("outputs/full/ETTh1/H720"),
+        device="cuda:0",
+    )
+
+    cfg = configure_backbone_run(base_cfg, job=job)
+    config_policy_cfg = configure_backbone_run(base_cfg, job=job, backbone_epoch_policy="config")
+
+    assert cfg["train"]["lr"] == 0.001
+    assert config_policy_cfg["train"]["lr"] == 0.0
+
+
 def test_two_stage_paths_are_derived_from_stage2_job() -> None:
     job = Job(
         dataset="weather",
