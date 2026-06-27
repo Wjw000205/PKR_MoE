@@ -112,6 +112,8 @@ def learnable_anchor_config() -> dict[str, Any]:
         "min_abs_improvement": 0.0,
         "min_rel_improvement": 0.0,
         "max_rel_mae_regression": 0.0,
+        "guard_fraction": 0.5,
+        "select_as_final": False,
     }
 
 
@@ -314,6 +316,15 @@ def disable_pred_side_residual_config(cfg: dict[str, Any]) -> None:
     cfg["moe"]["pred_side_residual"]["selection_policy"] = "none"
 
 
+def enable_pred_side_residual_config(cfg: dict[str, Any]) -> None:
+    cfg.setdefault("moe", {})
+    cfg["moe"].setdefault("pred_side_residual", {})
+    cfg["moe"]["pred_side_residual"]["enable"] = True
+    selection_policy = str(cfg["moe"]["pred_side_residual"].get("selection_policy", "") or "").strip().lower()
+    if not selection_policy or selection_policy == "none":
+        cfg["moe"]["pred_side_residual"]["selection_policy"] = "val_mse_candidate_channel"
+
+
 def disable_output_anchor_config(cfg: dict[str, Any]) -> None:
     cfg.setdefault("moe", {})
     cfg["moe"]["history_anchor_expert"] = {"enable": False}
@@ -383,6 +394,8 @@ def configure_run(
     cfg["moe"]["freeze_backbone"] = True
     if disable_pred_side_residual:
         disable_pred_side_residual_config(cfg)
+    else:
+        enable_pred_side_residual_config(cfg)
     cfg["moe"]["learnable_output_anchor_refiner"] = learnable_anchor_config()
     return cfg
 

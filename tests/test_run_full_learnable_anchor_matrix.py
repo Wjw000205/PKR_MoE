@@ -160,6 +160,70 @@ def test_configure_run_preserves_pred_side_residual_when_not_explicitly_disabled
     assert cfg["moe"]["pred_side_residual"]["corrector_hidden"] == 32
 
 
+def test_configure_run_forces_pred_side_residual_on_for_stage2() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
+        "window": {"input_len": 96, "pred_len": 720},
+        "train": {"epochs": 25, "lr": 0.001, "freeze_backbone": False},
+        "moe": {
+            "enable": True,
+            "freeze_backbone": True,
+            "pred_side_residual": {
+                "enable": False,
+                "selection_policy": "val_mse_candidate_channel",
+                "corrector_hidden": 32,
+            },
+        },
+    }
+    job = Job(
+        dataset="ETTh1",
+        horizon=720,
+        base_config_path=Path("configs/ETTh1_H720.yaml"),
+        config_path=Path("generated/ETTh1_H720_stage2.yaml"),
+        out_dir=Path("outputs/full/ETTh1/H720"),
+        device="cuda:0",
+    )
+
+    cfg = configure_run(
+        base_cfg,
+        job=job,
+        skip_test=False,
+        disable_pred_side_residual=False,
+    )
+
+    assert cfg["moe"]["enable"] is True
+    assert cfg["moe"]["pred_side_residual"]["enable"] is True
+    assert cfg["moe"]["pred_side_residual"]["selection_policy"] == "val_mse_candidate_channel"
+    assert cfg["moe"]["pred_side_residual"]["corrector_hidden"] == 32
+
+
+def test_configure_run_adds_pred_side_residual_selection_policy_when_missing() -> None:
+    base_cfg = {
+        "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},
+        "window": {"input_len": 96, "pred_len": 720},
+        "train": {"epochs": 25, "lr": 0.001, "freeze_backbone": False},
+        "moe": {"enable": True, "freeze_backbone": True},
+    }
+    job = Job(
+        dataset="ETTh1",
+        horizon=720,
+        base_config_path=Path("configs/ETTh1_H720.yaml"),
+        config_path=Path("generated/ETTh1_H720_stage2.yaml"),
+        out_dir=Path("outputs/full/ETTh1/H720"),
+        device="cuda:0",
+    )
+
+    cfg = configure_run(
+        base_cfg,
+        job=job,
+        skip_test=False,
+        disable_pred_side_residual=False,
+    )
+
+    assert cfg["moe"]["pred_side_residual"]["enable"] is True
+    assert cfg["moe"]["pred_side_residual"]["selection_policy"] == "val_mse_candidate_channel"
+
+
 def test_configure_run_restores_train_budget_for_frozen_stage2_wrappers() -> None:
     base_cfg = {
         "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:0"},

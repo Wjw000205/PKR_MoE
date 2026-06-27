@@ -3846,6 +3846,45 @@ def update_learnable_output_anchor_summary_with_split_metrics(
             summary[f"{prefix}_{key}"] = list(metrics[key])
 
 
+def _split_learnable_output_anchor_val_loader(
+    val_loader: DataLoader,
+    *,
+    guard_fraction: float,
+) -> Tuple[DataLoader, Optional[DataLoader], int, int]:
+    guard_fraction = max(0.0, min(float(guard_fraction), 0.95))
+    if guard_fraction <= 0.0:
+        return val_loader, None, 0, 0
+    dataset = getattr(val_loader, "dataset", None)
+    if dataset is None:
+        return val_loader, None, 0, 0
+    try:
+        n_val = int(len(dataset))
+    except TypeError:
+        return val_loader, None, 0, 0
+    if n_val < 2:
+        return val_loader, None, n_val, 0
+    guard_n = int(math.ceil(float(n_val) * guard_fraction))
+    guard_n = min(max(1, guard_n), n_val - 1)
+    select_n = n_val - guard_n
+    batch_size = int(getattr(val_loader, "batch_size", 0) or 1)
+    pin_memory = bool(getattr(val_loader, "pin_memory", False))
+    selection_loader = DataLoader(
+        Subset(dataset, range(0, select_n)),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+    guard_loader = DataLoader(
+        Subset(dataset, range(select_n, n_val)),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+    return selection_loader, guard_loader, int(select_n), int(guard_n)
+
+
 def train_learnable_output_anchor_refiner(
     *,
     model: nn.Module,
@@ -3902,11 +3941,15 @@ def train_learnable_output_anchor_refiner(
     adoption_scope = str(cfg.get("adoption_scope", "global")).lower()
     if adoption_scope not in {"global", "channel"}:
         raise ValueError("learnable_output_anchor_refiner.adoption_scope must be global or channel.")
+    guard_fraction = max(0.0, float(cfg.get("guard_fraction", 0.0)))
+    selection_val_loader, guard_val_loader, selection_windows, guard_windows = (
+        _split_learnable_output_anchor_val_loader(val_loader, guard_fraction=guard_fraction)
+    )
 
     initial_metrics = _evaluate_learnable_output_anchor_refiner(
         model=model,
         refiner=None,
-        loader=val_loader,
+        loader=selection_val_loader,
         cluster_id_c=cluster_id_c,
         moe_cfg=moe_cfg,
         device=device,
@@ -3967,7 +4010,7 @@ def train_learnable_output_anchor_refiner(
         metrics = _evaluate_learnable_output_anchor_refiner(
             model=model,
             refiner=refiner,
-            loader=val_loader,
+            loader=selection_val_loader,
             cluster_id_c=cluster_id_c,
             moe_cfg=moe_cfg,
             device=device,
@@ -3990,12 +4033,52 @@ def train_learnable_output_anchor_refiner(
 
     refiner.load_state_dict({name: value.to(device) for name, value in best_state.items()}, strict=True)
     unmasked_best_metrics = dict(best_metrics)
+    guard_initial_metrics = None
+    guard_unmasked_metrics = None
+    if guard_val_loader is not None:
+        guard_initial_metrics = _evaluate_learnable_output_anchor_refiner(
+            model=model,
+            refiner=None,
+            loader=guard_val_loader,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            device=device,
+            input_len=input_len,
+            eval_start=val_eval_start,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            static_batch_fn=static_batch_fn,
+        )
+        guard_unmasked_metrics = _evaluate_learnable_output_anchor_refiner(
+            model=model,
+            refiner=refiner,
+            loader=guard_val_loader,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            device=device,
+            input_len=input_len,
+            eval_start=val_eval_start,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            static_batch_fn=static_batch_fn,
+        )
     static_metric = float(initial_metrics[f"static_{selection_metric}"])
     min_abs = float(cfg.get("min_abs_improvement", 0.0))
     min_rel = float(cfg.get("min_rel_improvement", 0.0))
     required = max(max(0.0, min_abs), max(0.0, min_rel) * abs(static_metric))
     max_rel_mae_regression = float(cfg.get("max_rel_mae_regression", 0.0))
     adopted_channel_mask = None
+    selection_adopted_channel_mask = None
+    guard_adopted_channel_mask = None
+    global_guard_pass = True
     if adoption_scope == "channel":
         static_metric_c = torch.tensor(initial_metrics[f"static_{selection_metric}_c"], dtype=torch.float64)
         refined_metric_c = torch.tensor(unmasked_best_metrics[f"refined_{selection_metric}_c"], dtype=torch.float64)
@@ -4008,8 +4091,79 @@ def train_learnable_output_anchor_refiner(
         metric_gain_c = static_metric_c - refined_metric_c
         mae_regression_c = refined_mae_c - static_mae_c
         mae_allowed_c = mae_regression_c <= max(0.0, max_rel_mae_regression) * static_mae_c.abs().clamp_min(1.0e-12)
-        adopted_channel_mask = (metric_gain_c > required_c) & mae_allowed_c
+        selection_adopted_channel_mask = (metric_gain_c > required_c) & mae_allowed_c
+        adopted_channel_mask = selection_adopted_channel_mask
+        if guard_initial_metrics is not None and guard_unmasked_metrics is not None:
+            guard_static_metric_c = torch.tensor(
+                guard_initial_metrics[f"static_{selection_metric}_c"],
+                dtype=torch.float64,
+            )
+            guard_refined_metric_c = torch.tensor(
+                guard_unmasked_metrics[f"refined_{selection_metric}_c"],
+                dtype=torch.float64,
+            )
+            guard_static_mae_c = torch.tensor(guard_initial_metrics["static_mae_c"], dtype=torch.float64)
+            guard_refined_mae_c = torch.tensor(guard_unmasked_metrics["refined_mae_c"], dtype=torch.float64)
+            guard_required_c = torch.maximum(
+                torch.full_like(guard_static_metric_c, max(0.0, min_abs)),
+                max(0.0, min_rel) * guard_static_metric_c.abs(),
+            )
+            guard_metric_gain_c = guard_static_metric_c - guard_refined_metric_c
+            guard_mae_regression_c = guard_refined_mae_c - guard_static_mae_c
+            guard_mae_allowed_c = (
+                guard_mae_regression_c
+                <= max(0.0, max_rel_mae_regression) * guard_static_mae_c.abs().clamp_min(1.0e-12)
+            )
+            guard_adopted_channel_mask = (guard_metric_gain_c > guard_required_c) & guard_mae_allowed_c
+            adopted_channel_mask = adopted_channel_mask & guard_adopted_channel_mask
         refiner.set_channel_adoption_mask(adopted_channel_mask.to(device=device))
+        best_metrics = _evaluate_learnable_output_anchor_refiner(
+            model=model,
+            refiner=refiner,
+            loader=selection_val_loader,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            device=device,
+            input_len=input_len,
+            eval_start=val_eval_start,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            static_batch_fn=static_batch_fn,
+        )
+    elif guard_initial_metrics is not None and guard_unmasked_metrics is not None:
+        guard_static_metric = float(guard_initial_metrics[f"static_{selection_metric}"])
+        guard_refined_metric = float(guard_unmasked_metrics[f"refined_{selection_metric}"])
+        guard_required = max(max(0.0, min_abs), max(0.0, min_rel) * abs(guard_static_metric))
+        guard_metric_gain = guard_static_metric - guard_refined_metric
+        guard_mae_regression = float(guard_unmasked_metrics["refined_mae"] - guard_initial_metrics["static_mae"])
+        guard_mae_allowed = guard_mae_regression <= max(0.0, max_rel_mae_regression) * max(
+            abs(float(guard_initial_metrics["static_mae"])),
+            1.0e-12,
+        )
+        global_guard_pass = bool(guard_metric_gain > guard_required and guard_mae_allowed)
+    full_initial_metrics = initial_metrics
+    if guard_val_loader is not None:
+        full_initial_metrics = _evaluate_learnable_output_anchor_refiner(
+            model=model,
+            refiner=None,
+            loader=val_loader,
+            cluster_id_c=cluster_id_c,
+            moe_cfg=moe_cfg,
+            device=device,
+            input_len=input_len,
+            eval_start=val_eval_start,
+            history_anchor_cfg=history_anchor_cfg,
+            observed_history_tc=observed_history_tc,
+            model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+            model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+            train_stat_anchor_pc=train_stat_anchor_pc,
+            train_residual_anchor_phc=train_residual_anchor_phc,
+            static_batch_fn=static_batch_fn,
+        )
         best_metrics = _evaluate_learnable_output_anchor_refiner(
             model=model,
             refiner=refiner,
@@ -4028,10 +4182,15 @@ def train_learnable_output_anchor_refiner(
             static_batch_fn=static_batch_fn,
         )
     refined_metric = float(best_metrics[f"refined_{selection_metric}"])
+    static_metric = float(full_initial_metrics[f"static_{selection_metric}"])
+    required = max(max(0.0, min_abs), max(0.0, min_rel) * abs(static_metric))
     metric_gain = static_metric - refined_metric
-    mae_regression = float(best_metrics["refined_mae"] - initial_metrics["static_mae"])
-    mae_allowed = mae_regression <= max(0.0, max_rel_mae_regression) * max(abs(float(initial_metrics["static_mae"])), 1.0e-12)
-    adopted = bool(metric_gain > required and mae_allowed)
+    mae_regression = float(best_metrics["refined_mae"] - full_initial_metrics["static_mae"])
+    mae_allowed = mae_regression <= max(0.0, max_rel_mae_regression) * max(
+        abs(float(full_initial_metrics["static_mae"])),
+        1.0e-12,
+    )
+    adopted = bool(metric_gain > required and mae_allowed and global_guard_pass)
     if adoption_scope == "channel":
         adopted = bool(adopted and adopted_channel_mask is not None and bool(adopted_channel_mask.any().item()))
     summary.update(
@@ -4039,14 +4198,17 @@ def train_learnable_output_anchor_refiner(
             "adopted": adopted,
             "adoption_scope": adoption_scope,
             "selection_metric": selection_metric,
+            "guard_fraction": float(guard_fraction),
+            "selection_windows": int(selection_windows),
+            "guard_windows": int(guard_windows),
             "best_epoch": int(best_epoch),
             "epochs": int(epochs),
             "lr": float(lr),
             "weight_decay": float(weight_decay),
             "hidden_dim": int(cfg.get("hidden_dim", 16)),
             "max_delta_scale": float(cfg.get("max_delta_scale", 1.0)),
-            "val_static_mse": float(initial_metrics["static_mse"]),
-            "val_static_mae": float(initial_metrics["static_mae"]),
+            "val_static_mse": float(full_initial_metrics["static_mse"]),
+            "val_static_mae": float(full_initial_metrics["static_mae"]),
             "val_refined_mse": float(best_metrics["refined_mse"]),
             "val_refined_mae": float(best_metrics["refined_mae"]),
             "metric_gain": float(metric_gain),
@@ -4059,8 +4221,27 @@ def train_learnable_output_anchor_refiner(
             {
                 "adopted_channel_mask": [bool(v) for v in adopted_channel_mask.detach().cpu().tolist()],
                 "adopted_channel_count": int(adopted_channel_mask.sum().item()),
+                "selection_adopted_channel_mask": (
+                    [bool(v) for v in selection_adopted_channel_mask.detach().cpu().tolist()]
+                    if selection_adopted_channel_mask is not None
+                    else None
+                ),
+                "guard_adopted_channel_mask": (
+                    [bool(v) for v in guard_adopted_channel_mask.detach().cpu().tolist()]
+                    if guard_adopted_channel_mask is not None
+                    else None
+                ),
                 "val_refined_mse_unmasked": float(unmasked_best_metrics["refined_mse"]),
                 "val_refined_mae_unmasked": float(unmasked_best_metrics["refined_mae"]),
+            }
+        )
+    if guard_initial_metrics is not None and guard_unmasked_metrics is not None:
+        summary.update(
+            {
+                "guard_static_mse": float(guard_initial_metrics["static_mse"]),
+                "guard_static_mae": float(guard_initial_metrics["static_mae"]),
+                "guard_refined_mse_unmasked": float(guard_unmasked_metrics["refined_mse"]),
+                "guard_refined_mae_unmasked": float(guard_unmasked_metrics["refined_mae"]),
             }
         )
     if not adopted:
@@ -13717,6 +13898,7 @@ def main():
     learnable_output_anchor_cfg = moe_cfg.get("learnable_output_anchor_refiner", {}) or {}
     if not isinstance(learnable_output_anchor_cfg, dict):
         learnable_output_anchor_cfg = {"enable": bool(learnable_output_anchor_cfg)}
+    learnable_output_anchor_refiner_candidate_model = None
     learnable_output_anchor_refiner_model = None
     learnable_output_anchor_summary: Dict[str, object] = {
         "enable": bool(learnable_output_anchor_cfg.get("enable", False)),
@@ -14555,7 +14737,7 @@ def main():
                 num_workers=0,
                 pin_memory=pin_mem,
             )
-            learnable_output_anchor_refiner_model, learnable_output_anchor_summary = (
+            learnable_output_anchor_refiner_candidate_model, learnable_output_anchor_summary = (
                 train_learnable_output_anchor_refiner(
                     model=model,
                     train_loader=refiner_train_loader,
@@ -14578,6 +14760,19 @@ def main():
                     static_batch_fn=learnable_static_batch_fn,
                 )
             )
+            learnable_select_as_final = bool(learnable_output_anchor_cfg.get("select_as_final", True))
+            if (
+                learnable_output_anchor_refiner_candidate_model is not None
+                and bool(learnable_output_anchor_summary.get("adopted", False))
+                and learnable_select_as_final
+            ):
+                learnable_output_anchor_refiner_model = learnable_output_anchor_refiner_candidate_model
+            elif learnable_output_anchor_refiner_candidate_model is not None:
+                learnable_output_anchor_summary["diagnostic_val_adopted"] = bool(
+                    learnable_output_anchor_summary.get("adopted", False)
+                )
+                learnable_output_anchor_summary["adopted"] = False
+                learnable_output_anchor_summary["reason"] = "final_adoption_disabled"
             if learnable_output_anchor_refiner_model is not None:
                 (
                     val_refiner_loss_k,
@@ -14790,7 +14985,7 @@ def main():
         if bool(learnable_output_anchor_summary.get("enable", False)):
             learnable_test_metrics = _evaluate_learnable_output_anchor_refiner(
                 model=model,
-                refiner=learnable_output_anchor_refiner_model,
+                refiner=learnable_output_anchor_refiner_candidate_model,
                 loader=dl_te,
                 cluster_id_c=cluster_id_c,
                 moe_cfg=moe_cfg,

@@ -300,11 +300,63 @@ def test_posthoc_trainer_channel_scope_rejects_val_mse_regression_channels() -> 
     assert not torch.allclose(out[:, 0], static[:, 0])
 
 
+def test_posthoc_trainer_guard_rejects_selection_only_channel_gain() -> None:
+    torch.manual_seed(37)
+    cluster_id_c = torch.tensor([0], dtype=torch.long)
+    x_train = torch.randn(96, 1, 5)
+    x_val = torch.randn(64, 1, 5)
+    horizon_scale = torch.tensor([0.45, -0.25]).view(1, 1, 2)
+    y_train = x_train[..., -1:].expand(-1, -1, 2) * horizon_scale
+    y_val = torch.zeros(64, 1, 2)
+    y_val[:32] = x_val[:32, :, -1:].expand(-1, -1, 2) * horizon_scale
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x_train, y_train, torch.arange(x_train.shape[0])),
+        batch_size=16,
+        shuffle=False,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(x_val, y_val, torch.arange(x_val.shape[0])),
+        batch_size=16,
+        shuffle=False,
+    )
+
+    refiner, summary = train_learnable_output_anchor_refiner(
+        model=_ZeroBackbone(),
+        train_loader=train_loader,
+        val_loader=val_loader,
+        cluster_id_c=cluster_id_c,
+        K=1,
+        moe_cfg={"enable": False, "detach_penalty_grad": True},
+        device=torch.device("cpu"),
+        input_len=5,
+        channel_count=1,
+        cfg={
+            "enable": True,
+            "hidden_dim": 16,
+            "epochs": 160,
+            "lr": 0.05,
+            "weight_decay": 0.0,
+            "selection_metric": "mse",
+            "adoption_scope": "channel",
+            "guard_fraction": 0.5,
+        },
+    )
+
+    assert refiner is None
+    assert summary["adopted"] is False
+    assert summary["selection_adopted_channel_mask"] == [True]
+    assert summary["guard_adopted_channel_mask"] == [False]
+    assert summary["adopted_channel_count"] == 0
+
+
 def test_main_wires_learnable_output_anchor_into_final_eval_and_summary() -> None:
     source = inspect.getsource(train_module.main)
 
     assert "learnable_output_anchor_refiner_model" in source
+    assert "learnable_output_anchor_refiner_candidate_model" in source
+    assert "select_as_final" in source
     assert "learnable_output_anchor_refiner=learnable_output_anchor_refiner_model" in source
+    assert "refiner=learnable_output_anchor_refiner_candidate_model" in source
     assert "update_learnable_output_anchor_summary_with_split_metrics" in source
     assert 'split="test"' in source
     assert '"learnable_output_anchor_refiner": learnable_output_anchor_summary' in source

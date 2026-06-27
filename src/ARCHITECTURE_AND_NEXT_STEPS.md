@@ -4554,6 +4554,32 @@ Hand back the report and STOP. Do not start a follow-up without me.
     epoch count but stage2 candidate/eval wiring or config inheritance for PKR-MoE residual
     participation on this ETTh1-H720 path (`pred_side_residual.enable:false`,
     `lambda_init=0`, `learnable_lambda=false`).
+    Follow-up fix and generalization diagnosis (same date): `configure_run()` now forces
+    `moe.pred_side_residual.enable:true` for full stage-2 jobs unless
+    `--disable-pred-side-residual` is explicitly passed, preserving/inserting
+    `selection_policy: val_mse_candidate_channel` when needed. Local ETTh1-H720 rerun in
+    `outputs\local_etth1_h720_pipeline_check_20260627` confirmed both paths are active:
+    stage2 logs show `Prediction residual MoE enabled` and
+    `Prediction residual selection`, with `moe_residual=moe_residual_channel`.
+    Residual contribution is tiny (`val_base_MSE=1.400407`, `val_scaled_MSE=1.400399`);
+    learnable output anchor remains the dominant val mover but still fails test
+    generalization (`val_static/refined MSE 1.400399 -> 1.293939`, while
+    `test_static/refined MSE 0.462661 -> 0.471905`). Added a no-test temporal guard
+    for learnable anchor (`guard_fraction`, channel adoption must also improve the tail
+    validation slice). On ETTh1-H720, `guard_fraction:0.5` removed one channel but did
+    not solve the distribution shift (`test_static/refined MSE 0.462661 -> 0.469055`).
+    Verdict: this is a train-val/test shift / selection-generalization failure, not a
+    missing-stage2-wiring failure. To preserve the no-regret table while still measuring
+    the learned anchor, the full runner now sets `learnable_output_anchor_refiner.select_as_final:false`:
+    the refiner is trained and its static/refined val/test diagnostics are written to
+    `summary.csv`, but final `selected` stays on the PKR-MoE/static path unless a config
+    explicitly opts into final adoption. Final local ETTh1-H720 check with this mode:
+    `selected=moe_residual_channel`, `test_MSE/MAE=0.462661/0.460880`,
+    while diagnostic learnable refined remains recorded as worse
+    (`test_refined_MSE/MAE=0.469055/0.464358`). Validation:
+    `python -m pytest tests\test_history_anchor_adapter.py tests\test_pred_residual_anchor_wiring.py tests\test_learnable_output_anchor.py tests\test_run_full_learnable_anchor_matrix.py -q`
+    -> 146 passed; `python -m py_compile src\train.py scripts\run_full_learnable_anchor_matrix.py`
+    passed.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits
