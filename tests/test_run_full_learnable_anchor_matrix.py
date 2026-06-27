@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import scripts.run_full_learnable_anchor_matrix as runner
 from scripts.run_full_learnable_anchor_matrix import (
     DEFAULT_DEVICES,
     DEFAULT_WORKERS_PER_DEVICE,
@@ -9,8 +10,11 @@ from scripts.run_full_learnable_anchor_matrix import (
     assign_jobs_to_devices,
     build_matrix,
     configure_run,
+    format_duration,
+    format_progress_line,
     learnable_anchor_config,
     run_environment_for_job,
+    run_assigned,
 )
 
 
@@ -113,3 +117,74 @@ def test_run_environment_does_not_remap_physical_cuda_device() -> None:
 
     assert "CUDA_VISIBLE_DEVICES" not in env
     assert env["PYTHONUTF8"] == "1"
+
+
+def test_format_duration_is_stable_for_progress_output() -> None:
+    assert format_duration(0) == "00:00:00"
+    assert format_duration(65.9) == "00:01:05"
+    assert format_duration(3661) == "01:01:01"
+
+
+def test_format_progress_line_shows_count_percent_job_worker_and_error() -> None:
+    job = Job(
+        dataset="ETTh1",
+        horizon=96,
+        base_config_path=Path("base.yaml"),
+        config_path=Path("cfg.yaml"),
+        out_dir=Path("out"),
+        device="cuda:0",
+    )
+
+    line = format_progress_line(
+        completed=3,
+        total=40,
+        job=job,
+        worker_key="cuda:0#1",
+        status="failed",
+        elapsed_s=65,
+        error="see outputs/logs/ETTh1_H96.log",
+    )
+
+    assert line == (
+        "[3/40 7.5%] FAILED ETTh1_H96 device=cuda:0 "
+        "worker=cuda:0#1 elapsed=00:01:05 error=see outputs/logs/ETTh1_H96.log"
+    )
+
+
+def test_run_assigned_emits_start_and_finish_progress(tmp_path: Path, monkeypatch) -> None:
+    job = Job(
+        dataset="weather",
+        horizon=96,
+        base_config_path=Path("base.yaml"),
+        config_path=Path("cfg.yaml"),
+        out_dir=tmp_path / "weather_H96",
+        device="cuda:0",
+    )
+
+    def fake_run_job(job: Job, *, python_exe: str, resume: bool, log_dir: Path):
+        assert python_exe
+        assert resume is False
+        assert log_dir == tmp_path / "logs"
+        return {
+            "status": "ok",
+            "dataset": job.dataset,
+            "horizon": job.horizon,
+            "device": job.device,
+            "config_path": str(job.config_path),
+            "out_dir": str(job.out_dir),
+        }
+
+    monkeypatch.setattr(runner, "run_job", fake_run_job)
+    progress_lines: list[str] = []
+
+    run_assigned(
+        {"cuda:0#1": [job]},
+        python_exe="python",
+        resume=False,
+        summary_path=tmp_path / "summary.csv",
+        log_dir=tmp_path / "logs",
+        progress=progress_lines.append,
+    )
+
+    assert progress_lines[0].startswith("[0/1 0.0%] START weather_H96")
+    assert progress_lines[1].startswith("[1/1 100.0%] OK weather_H96")

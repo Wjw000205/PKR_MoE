@@ -4355,6 +4355,10 @@ Hand back the report and STOP. Do not start a follow-up without me.
     `python scripts\run_full_learnable_anchor_matrix.py --out-root outputs\full_learnable_anchor_matrix_20260627 --devices cuda:0,cuda:2,cuda:5 --workers-per-device 2 --resume`.
     Add `--skip-test` for val-only discipline; omit it only for an intentional full train+test
     pass.
+    Follow-up: added flushed per-job progress output after the first server run showed no visible
+    progress while 40 jobs executed. The runner now emits `START` and terminal status lines such as
+    `[3/40 7.5%] FAILED ETTh1_H96 device=cuda:0 worker=cuda:0#1 elapsed=00:01:05 ...` while still
+    writing `summary.csv` incrementally.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits

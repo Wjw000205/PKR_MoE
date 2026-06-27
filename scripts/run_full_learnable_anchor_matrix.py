@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -188,6 +188,41 @@ def assign_jobs_to_devices(
     return assigned
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_progress_line(
+    *,
+    completed: int,
+    total: int,
+    job: Job,
+    worker_key: str,
+    status: str,
+    elapsed_s: float,
+    error: str = "",
+) -> str:
+    percent = 0.0 if total <= 0 else completed / total * 100.0
+    parts = [
+        f"[{completed}/{total} {percent:.1f}%]",
+        status.upper(),
+        f"{job.dataset}_H{job.horizon}",
+        f"device={job.device}",
+        f"worker={worker_key}",
+        f"elapsed={format_duration(elapsed_s)}",
+    ]
+    if error:
+        parts.append(f"error={error}")
+    return " ".join(parts)
+
+
+def print_progress(line: str) -> None:
+    print(line, flush=True)
+
+
 def completed_summary(path: Path) -> bool:
     summary = read_json(path)
     val = summary.get("val") or {}
@@ -321,19 +356,49 @@ def run_assigned(
     resume: bool,
     summary_path: Path,
     log_dir: Path,
+    progress: Callable[[str], None] | None = print_progress,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     rows_lock = threading.Lock()
+    total_jobs = sum(len(jobs) for jobs in assigned.values())
+    completed_jobs = 0
+    started_at = time.time()
 
     def run_worker(worker_key: str, worker_jobs: list[Job]) -> list[dict[str, Any]]:
+        nonlocal completed_jobs
         worker_rows: list[dict[str, Any]] = []
         for job in worker_jobs:
+            if progress is not None:
+                with rows_lock:
+                    progress(
+                        format_progress_line(
+                            completed=completed_jobs,
+                            total=total_jobs,
+                            job=job,
+                            worker_key=worker_key,
+                            status="start",
+                            elapsed_s=time.time() - started_at,
+                        )
+                    )
             row = run_job(job, python_exe=python_exe, resume=resume, log_dir=log_dir)
             row["worker"] = worker_key
             worker_rows.append(row)
             with rows_lock:
+                completed_jobs += 1
                 rows.append(row)
                 write_rows(summary_path, rows)
+                if progress is not None:
+                    progress(
+                        format_progress_line(
+                            completed=completed_jobs,
+                            total=total_jobs,
+                            job=job,
+                            worker_key=worker_key,
+                            status=str(row.get("status", "done")),
+                            elapsed_s=time.time() - started_at,
+                            error=str(row.get("error", "")),
+                        )
+                    )
         return worker_rows
 
     with ThreadPoolExecutor(max_workers=len(assigned)) as executor:
