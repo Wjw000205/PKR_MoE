@@ -4370,6 +4370,35 @@ Hand back the report and STOP. Do not start a follow-up without me.
     pointing to the matching `H*_backbone/best_checkpoint.pt`, `moe.freeze_backbone:true`). Dry-run
     validation confirmed 40/40 backbone configs save checkpoints and 40/40 stage-2 configs load the
     matching freshly trained backbone checkpoint.
+    Local ETT serial probe and generalization diagnosis (same date): added `--datasets` and
+    `--horizons` filters to the full-matrix runner, then launched a local serial ETT-only run with
+    `C:\Users\33932\.conda\envs\my_fram\python.exe`, `--devices cuda:0`,
+    `--workers-per-device 1`, `--datasets ETTh1,ETTh2,ETTm1,ETTm2`, and
+    `--horizons 96,192,336,720` under
+    `outputs/full_learnable_anchor_ett_serial_local_fixed_20260627`. The first attempt failed
+    because base ETT configs inherited unsupported
+    `moe.pred_side_residual.selection_policy: val_mse_candidate_channel_guarded`; fixed the
+    runner so disabled pred-side residual also sets `selection_policy: none` in both backbone and
+    stage-2 configs. Completed 11/16 before halting for diagnosis after user correctly noted that
+    val gains without test generalization are not meaningful. Partial main-table comparison is in
+    `outputs/full_learnable_anchor_ett_serial_local_fixed_20260627/current_vs_main_table_partial.md`:
+    completed rows averaged +10.73% MSE / +7.00% MAE worse than main-table PKR-MoE on test, even
+    though same-run learnable-vs-static val improved by -4.27% MSE / -2.35% MAE. This comparison
+    is not a clean anchor A/B because the generated runner disables pred-side residual and retrains
+    a fresh backbone, so its base pipeline is not equivalent to the tuned main-table runs.
+    Added `learnable_output_anchor_refiner` test static/refined diagnostics to `src/train.py` and
+    exported them from the runner summary. Controlled probes:
+    `outputs/learnable_anchor_generalization_probe_etth1h96_20260627` and
+    `outputs/learnable_anchor_generalization_probe_20260627` show that the refiner itself does not
+    explain the main-table regression: ETTh1-H96 test static/refined is essentially neutral
+    (`0.375/0.400 -> 0.375/0.400`), and ETTh1-H720 improves within-run test
+    (`0.938/0.647 -> 0.732/0.642`) while still being far worse than the main table
+    (`0.463/0.461`). Diagnosis: base-pipeline mismatch / pred-side residual removal and fresh
+    backbone retraining dominate; do not judge learnable-anchor adoption from this full-runner
+    table. Next smallest action: run checkpoint-preserving, main-table-config probes that add the
+    learnable refiner without disabling existing tuned components, or first implement refiner
+    support after the pred-side residual path so ETT comparisons are true A/B. Until that is done,
+    avoid a server full test matrix for ETT as it will answer the wrong question.
   - Full matrix non-regression analyzer (2026-06-27): added
     `scripts/analyze_full_learnable_anchor_matrix.py` as the post-run gate for the full matrix.
     It reads the runner's `summary.csv`, writes `analysis.csv` and `analysis.json`, and exits

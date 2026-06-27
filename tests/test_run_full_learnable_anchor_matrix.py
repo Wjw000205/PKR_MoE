@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -19,6 +20,7 @@ from scripts.run_full_learnable_anchor_matrix import (
     format_progress_line,
     learnable_anchor_config,
     prepare_configs,
+    row_from_summary,
     run_environment_for_job,
     run_assigned,
 )
@@ -38,6 +40,25 @@ def test_matrix_covers_requested_dataset_horizons() -> None:
     assert len(jobs) == 40
 
 
+def test_matrix_can_filter_to_ett_datasets_and_standard_horizons() -> None:
+    jobs = build_matrix(
+        out_root=Path("outputs/ett"),
+        devices=("cuda:0",),
+        datasets=("ETTh1", "ETTh2", "ETTm1", "ETTm2"),
+        horizons=(96, 192, 336, 720),
+    )
+
+    keys = [(job.dataset, job.horizon) for job in jobs]
+
+    assert len(jobs) == 16
+    assert keys == [
+        (dataset, horizon)
+        for dataset in ("ETTh1", "ETTh2", "ETTm1", "ETTm2")
+        for horizon in (96, 192, 336, 720)
+    ]
+    assert {job.device for job in jobs} == {"cuda:0"}
+
+
 def test_configure_run_enables_pkr_moe_and_learnable_anchor_without_changing_training_schedule() -> None:
     base_cfg = {
         "exp": {"name": "base", "out_dir": "outputs/base", "device": "cuda:7"},
@@ -55,7 +76,10 @@ def test_configure_run_enables_pkr_moe_and_learnable_anchor_without_changing_tra
         "moe": {
             "enable": False,
             "freeze_backbone": True,
-            "pred_side_residual": {"enable": True},
+            "pred_side_residual": {
+                "enable": True,
+                "selection_policy": "val_mse_candidate_channel_guarded",
+            },
         },
     }
     job = Job(
@@ -94,6 +118,7 @@ def test_configure_run_enables_pkr_moe_and_learnable_anchor_without_changing_tra
     assert cfg["moe"]["enable"] is True
     assert cfg["moe"]["freeze_backbone"] is True
     assert cfg["moe"]["pred_side_residual"]["enable"] is False
+    assert cfg["moe"]["pred_side_residual"]["selection_policy"] == "none"
     assert cfg["moe"]["learnable_output_anchor_refiner"] == learnable_anchor_config()
 
 
@@ -110,6 +135,10 @@ def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
         "moe": {
             "enable": True,
             "freeze_backbone": True,
+            "pred_side_residual": {
+                "enable": True,
+                "selection_policy": "val_mse_candidate_channel_guarded",
+            },
             "learnable_output_anchor_refiner": {"enable": True},
         },
         "memory": {"save_checkpoint": False, "checkpoint_path": "old/best.pt"},
@@ -138,6 +167,8 @@ def test_configure_backbone_run_trains_and_saves_backbone_checkpoint() -> None:
     assert cfg["train"]["freeze_backbone"] is False
     assert cfg["moe"]["enable"] is False
     assert cfg["moe"]["freeze_backbone"] is False
+    assert cfg["moe"]["pred_side_residual"]["enable"] is False
+    assert cfg["moe"]["pred_side_residual"]["selection_policy"] == "none"
     assert cfg["moe"]["learnable_output_anchor_refiner"]["enable"] is False
     assert cfg["memory"]["save_checkpoint"] is True
     assert cfg["memory"]["checkpoint_path"] == "outputs/full/PEMS08/H96_backbone/best_checkpoint.pt"
@@ -191,6 +222,46 @@ def test_prepare_configs_writes_backbone_and_stage2_configs(tmp_path: Path) -> N
     assert stage2_cfg["moe"]["enable"] is True
     assert stage2_cfg["moe"]["freeze_backbone"] is True
     assert stage2_cfg["finetune"]["checkpoint_path"].endswith("H96_backbone/best_checkpoint.pt")
+
+
+def test_row_from_summary_exports_learnable_test_generalization_metrics(tmp_path: Path) -> None:
+    out_dir = tmp_path / "runs" / "ETTh1" / "H96"
+    out_dir.mkdir(parents=True)
+    (out_dir / "run_summary.json").write_text(
+        json.dumps(
+            {
+                "val": {"avg_mse": 1.0, "avg_mae": 2.0},
+                "test": {"avg_mse": 3.0, "avg_mae": 4.0},
+                "learnable_output_anchor_refiner": {
+                    "val_static_mse": 1.1,
+                    "val_refined_mse": 1.0,
+                    "val_static_mae": 2.2,
+                    "val_refined_mae": 2.0,
+                    "test_static_mse": 3.3,
+                    "test_refined_mse": 3.0,
+                    "test_static_mae": 4.4,
+                    "test_refined_mae": 4.0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    job = Job(
+        dataset="ETTh1",
+        horizon=96,
+        base_config_path=Path("base.yaml"),
+        config_path=tmp_path / "cfg.yaml",
+        out_dir=out_dir,
+        device="cuda:0",
+    )
+
+    row = row_from_summary(job, status="ok")
+
+    assert row["learnable_test_static_mse"] == 3.3
+    assert row["learnable_test_refined_mse"] == 3.0
+    assert row["learnable_test_static_mae"] == 4.4
+    assert row["learnable_test_refined_mae"] == 4.0
 
 
 def test_assign_jobs_to_devices_round_robins_over_workers() -> None:

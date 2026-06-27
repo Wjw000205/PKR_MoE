@@ -1,10 +1,12 @@
 import inspect
 
+import pytest
 import torch
 
 import src.train as train_module
 from src.models.learnable_anchor import ClusterwiseLearnableOutputAnchorRefiner
 from src.train import eval_loop, train_learnable_output_anchor_refiner
+from src.train import update_learnable_output_anchor_summary_with_split_metrics
 
 
 class _ZeroBackbone(torch.nn.Module):
@@ -295,4 +297,33 @@ def test_main_wires_learnable_output_anchor_into_final_eval_and_summary() -> Non
 
     assert "learnable_output_anchor_refiner_model" in source
     assert "learnable_output_anchor_refiner=learnable_output_anchor_refiner_model" in source
+    assert "update_learnable_output_anchor_summary_with_split_metrics" in source
+    assert 'split="test"' in source
     assert '"learnable_output_anchor_refiner": learnable_output_anchor_summary' in source
+
+
+def test_summary_split_metrics_include_static_and_refined_generalization_fields() -> None:
+    summary = {"enable": True}
+
+    update_learnable_output_anchor_summary_with_split_metrics(
+        summary,
+        split="test",
+        metrics={
+            "static_mse": 1.0,
+            "static_mae": 2.0,
+            "refined_mse": 0.9,
+            "refined_mae": 1.8,
+            "static_mse_c": [1.0, 2.0],
+            "refined_mse_c": [0.9, 2.2],
+            "static_mae_c": [3.0, 4.0],
+            "refined_mae_c": [2.9, 4.1],
+        },
+    )
+
+    assert summary["test_static_mse"] == 1.0
+    assert summary["test_refined_mse"] == 0.9
+    assert summary["test_static_mae"] == 2.0
+    assert summary["test_refined_mae"] == 1.8
+    assert summary["test_mse_gain"] == pytest.approx(0.1)
+    assert summary["test_mae_gain"] == pytest.approx(0.2)
+    assert summary["test_refined_mse_c"] == [0.9, 2.2]

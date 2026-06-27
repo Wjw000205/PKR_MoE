@@ -23,6 +23,7 @@ STANDARD_HORIZONS = (96, 192, 336, 720)
 PEMS_HORIZONS = (12, 24, 48, 96)
 STANDARD_DATASETS = ("ETTh1", "ETTh2", "ETTm1", "ETTm2", "weather", "electricity")
 PEMS_DATASETS = ("PEMS03", "PEMS04", "PEMS07", "PEMS08")
+ALL_DATASETS = STANDARD_DATASETS + PEMS_DATASETS
 
 SUMMARY_FIELDS = [
     "status",
@@ -42,6 +43,12 @@ SUMMARY_FIELDS = [
     "learnable_val_refined_mse",
     "learnable_val_static_mae",
     "learnable_val_refined_mae",
+    "learnable_test_static_mse",
+    "learnable_test_refined_mse",
+    "learnable_test_static_mae",
+    "learnable_test_refined_mae",
+    "learnable_test_mse_gain",
+    "learnable_test_mae_gain",
     "best_epoch",
     "total_sec",
     "avg_epoch_sec",
@@ -100,22 +107,45 @@ def base_config_path(dataset: str, horizon: int) -> Path:
     return ROOT / "configs" / f"{dataset}_H{horizon}.yaml"
 
 
-def iter_dataset_horizons() -> list[tuple[str, int]]:
+def iter_dataset_horizons(
+    *,
+    datasets: tuple[str, ...] | None = None,
+    horizons: tuple[int, ...] | None = None,
+) -> list[tuple[str, int]]:
+    dataset_filter = set(datasets) if datasets is not None else None
+    horizon_filter = set(int(horizon) for horizon in horizons) if horizons is not None else None
     pairs: list[tuple[str, int]] = []
     for dataset in STANDARD_DATASETS:
+        if dataset_filter is not None and dataset not in dataset_filter:
+            continue
         for horizon in STANDARD_HORIZONS:
+            if horizon_filter is not None and horizon not in horizon_filter:
+                continue
             pairs.append((dataset, horizon))
     for dataset in PEMS_DATASETS:
+        if dataset_filter is not None and dataset not in dataset_filter:
+            continue
         for horizon in PEMS_HORIZONS:
+            if horizon_filter is not None and horizon not in horizon_filter:
+                continue
             pairs.append((dataset, horizon))
     return pairs
 
 
-def build_matrix(*, out_root: Path, devices: tuple[str, ...] = DEFAULT_DEVICES) -> list[Job]:
+def build_matrix(
+    *,
+    out_root: Path,
+    devices: tuple[str, ...] = DEFAULT_DEVICES,
+    datasets: tuple[str, ...] | None = None,
+    horizons: tuple[int, ...] | None = None,
+) -> list[Job]:
     jobs: list[Job] = []
     if not devices:
         raise ValueError("At least one device is required.")
-    for idx, (dataset, horizon) in enumerate(iter_dataset_horizons()):
+    dataset_horizons = iter_dataset_horizons(datasets=datasets, horizons=horizons)
+    if not dataset_horizons:
+        raise ValueError("No dataset/horizon jobs matched the requested filters.")
+    for idx, (dataset, horizon) in enumerate(dataset_horizons):
         config_path = out_root / "configs" / dataset / f"H{horizon}_stage2.yaml"
         out_dir = out_root / "runs" / dataset / f"H{horizon}"
         jobs.append(
@@ -129,6 +159,36 @@ def build_matrix(*, out_root: Path, devices: tuple[str, ...] = DEFAULT_DEVICES) 
             )
         )
     return jobs
+
+
+def parse_dataset_filter(value: str) -> tuple[str, ...] | None:
+    value = str(value or "").strip()
+    if not value or value.lower() == "all":
+        return None
+    canonical = {dataset.lower(): dataset for dataset in ALL_DATASETS}
+    datasets: list[str] = []
+    for item in value.replace(";", ",").split(","):
+        key = item.strip()
+        if not key:
+            continue
+        dataset = canonical.get(key.lower())
+        if dataset is None:
+            raise ValueError(f"Unknown dataset '{key}'. Valid datasets: {', '.join(ALL_DATASETS)}")
+        datasets.append(dataset)
+    return tuple(dict.fromkeys(datasets))
+
+
+def parse_horizon_filter(value: str) -> tuple[int, ...] | None:
+    value = str(value or "").strip()
+    if not value or value.lower() == "all":
+        return None
+    horizons: list[int] = []
+    for item in value.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        horizons.append(int(item))
+    return tuple(dict.fromkeys(horizons))
 
 
 def backbone_config_path(job: Job) -> Path:
@@ -161,6 +221,13 @@ def configure_common_paths(cfg: dict[str, Any], *, job: Job) -> None:
     cfg["memory"]["checkpoint_path"] = (job.out_dir / "best_checkpoint.pt").as_posix()
 
 
+def disable_pred_side_residual_config(cfg: dict[str, Any]) -> None:
+    cfg.setdefault("moe", {})
+    cfg["moe"].setdefault("pred_side_residual", {})
+    cfg["moe"]["pred_side_residual"]["enable"] = False
+    cfg["moe"]["pred_side_residual"]["selection_policy"] = "none"
+
+
 def configure_backbone_run(base_cfg: dict[str, Any], *, job: Job) -> dict[str, Any]:
     backbone_job = replace(
         job,
@@ -178,6 +245,7 @@ def configure_backbone_run(base_cfg: dict[str, Any], *, job: Job) -> dict[str, A
     cfg["moe"]["enable"] = False
     cfg["moe"]["freeze_backbone"] = False
     cfg["moe"]["learnable_output_anchor_refiner"] = {"enable": False}
+    disable_pred_side_residual_config(cfg)
     cfg.setdefault("eval", {})
     cfg["eval"]["skip_test"] = True
     cfg.setdefault("memory", {})
@@ -217,8 +285,7 @@ def configure_run(
     cfg["moe"]["enable"] = True
     cfg["moe"]["freeze_backbone"] = True
     if disable_pred_side_residual:
-        cfg["moe"].setdefault("pred_side_residual", {})
-        cfg["moe"]["pred_side_residual"]["enable"] = False
+        disable_pred_side_residual_config(cfg)
     cfg["moe"]["learnable_output_anchor_refiner"] = learnable_anchor_config()
     return cfg
 
@@ -311,6 +378,12 @@ def row_from_summary(job: Job, *, status: str, returncode: int = 0, error: str =
         "learnable_val_refined_mse": learnable.get("val_refined_mse"),
         "learnable_val_static_mae": learnable.get("val_static_mae"),
         "learnable_val_refined_mae": learnable.get("val_refined_mae"),
+        "learnable_test_static_mse": learnable.get("test_static_mse"),
+        "learnable_test_refined_mse": learnable.get("test_refined_mse"),
+        "learnable_test_static_mae": learnable.get("test_static_mae"),
+        "learnable_test_refined_mae": learnable.get("test_refined_mae"),
+        "learnable_test_mse_gain": learnable.get("test_mse_gain"),
+        "learnable_test_mae_gain": learnable.get("test_mae_gain"),
         "best_epoch": json.dumps(summary.get("best_epoch", ""), ensure_ascii=False),
         "total_sec": timing.get("total_time_s"),
         "avg_epoch_sec": timing.get("avg_epoch_time_s"),
@@ -494,6 +567,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", default=",".join(DEFAULT_DEVICES))
     parser.add_argument("--workers-per-device", type=int, default=DEFAULT_WORKERS_PER_DEVICE)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--datasets", default="all", help="Comma-separated dataset list, or all.")
+    parser.add_argument("--horizons", default="all", help="Comma-separated horizon list, or all.")
     parser.add_argument("--dry-run", action="store_true", help="Only generate configs and summary plan.")
     parser.add_argument("--resume", action="store_true", help="Skip jobs with completed run_summary.json.")
     parser.add_argument("--skip-test", action=argparse.BooleanOptionalAction, default=False)
@@ -505,7 +580,9 @@ def main() -> None:
     args = parse_args()
     out_root = Path(args.out_root)
     devices = tuple(device.strip() for device in str(args.devices).split(",") if device.strip())
-    jobs = build_matrix(out_root=out_root, devices=devices)
+    datasets = parse_dataset_filter(str(args.datasets))
+    horizons = parse_horizon_filter(str(args.horizons))
+    jobs = build_matrix(out_root=out_root, devices=devices, datasets=datasets, horizons=horizons)
     prepare_configs(
         jobs,
         skip_test=bool(args.skip_test),

@@ -3652,6 +3652,30 @@ def _evaluate_learnable_output_anchor_refiner(
     }
 
 
+def update_learnable_output_anchor_summary_with_split_metrics(
+    summary: Dict[str, object],
+    *,
+    split: str,
+    metrics: Dict[str, object],
+) -> None:
+    prefix = str(split).strip().lower()
+    if not prefix:
+        raise ValueError("split must be non-empty")
+    static_mse = float(metrics["static_mse"])
+    static_mae = float(metrics["static_mae"])
+    refined_mse = float(metrics["refined_mse"])
+    refined_mae = float(metrics["refined_mae"])
+    summary[f"{prefix}_static_mse"] = static_mse
+    summary[f"{prefix}_static_mae"] = static_mae
+    summary[f"{prefix}_refined_mse"] = refined_mse
+    summary[f"{prefix}_refined_mae"] = refined_mae
+    summary[f"{prefix}_mse_gain"] = static_mse - refined_mse
+    summary[f"{prefix}_mae_gain"] = static_mae - refined_mae
+    for key in ("static_mse_c", "static_mae_c", "refined_mse_c", "refined_mae_c"):
+        if key in metrics:
+            summary[f"{prefix}_{key}"] = list(metrics[key])
+
+
 def train_learnable_output_anchor_refiner(
     *,
     model: nn.Module,
@@ -14562,6 +14586,28 @@ def main():
             eval_start=test_eval_start,
             diagnostic_collector=prediction_diag_collector,
         )
+        if bool(learnable_output_anchor_summary.get("enable", False)):
+            learnable_test_metrics = _evaluate_learnable_output_anchor_refiner(
+                model=model,
+                refiner=learnable_output_anchor_refiner_model,
+                loader=dl_te,
+                cluster_id_c=cluster_id_c,
+                moe_cfg=moe_cfg,
+                device=device,
+                input_len=L,
+                eval_start=test_eval_start,
+                history_anchor_cfg=history_anchor_cfg,
+                observed_history_tc=data_window_tc,
+                model_train_stat_adapter_pc=model_train_stat_adapter_pc,
+                model_train_stat_adapter_cfg=model_train_stat_adapter_cfg,
+                train_stat_anchor_pc=train_stat_anchor_pc,
+                train_residual_anchor_phc=train_residual_anchor_phc,
+            )
+            update_learnable_output_anchor_summary_with_split_metrics(
+                learnable_output_anchor_summary,
+                split="test",
+                metrics=learnable_test_metrics,
+            )
         gate_penalty_hit_cfg = moe_cfg.get("gate_penalty_hit", {}) or {}
         gate_penalty_hit_enable = bool(gate_penalty_hit_cfg.get("enable", True))
         if gate_penalty_hit_enable and pred_residual is not None and moe_enable and P > 0:
